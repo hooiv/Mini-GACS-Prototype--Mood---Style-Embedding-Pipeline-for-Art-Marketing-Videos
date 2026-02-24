@@ -58,6 +58,7 @@ from src.visualization import (
     generate_similarity_report,
 )
 from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+from src.clustering import VibeClusterer, auto_n_clusters
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -119,6 +120,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Number of query frames selected for top-k retrieval (default: 3).",
+    )
+    p.add_argument(
+        "--n-clusters",
+        type=int,
+        default=0,
+        metavar="K",
+        help="Number of vibe clusters (default: 0 = auto-detect).",
     )
     return p.parse_args()
 
@@ -302,6 +310,44 @@ def main() -> None:
 
     except (RuntimeError, ValueError, OSError, ImportError) as exc:
         logger.warning("Affective scoring step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 9 – Vibe clustering
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 9: Vibe clustering ===")
+    try:
+        n_frames = embeddings.shape[0]
+        k = args.n_clusters if args.n_clusters >= 2 else auto_n_clusters(
+            embeddings, max_k=min(10, n_frames - 1)
+        )
+        k = max(2, min(k, n_frames - 1))  # clamp to valid range
+
+        clusterer = VibeClusterer(n_clusters=k)
+        labels = clusterer.fit(embeddings)
+
+        print(f"\n── Vibe clustering: {k} clusters, {n_frames} frames ──")
+        summary = clusterer.cluster_summary(labels, index, embeddings=embeddings)
+        for cid, info in summary.items():
+            print(f"  Cluster {cid}: {info['size']} frames  "
+                  f"videos={info['video_distribution']}")
+        print()
+
+        scatter_path = clusterer.plot_scatter(
+            embeddings, labels, index,
+            output_path=os.path.join(OUTPUTS_DIR, "vibe_cluster_scatter.png"),
+            projection="pca",
+            title=f"Vibe Cluster Map – {k} clusters (PCA)",
+        )
+        print(f"  Cluster scatter: {scatter_path}")
+
+        assign_path = clusterer.save_cluster_assignments(
+            labels, index,
+            output_path=os.path.join(OUTPUTS_DIR, "cluster_assignments.json"),
+        )
+        print(f"  Cluster assignments: {assign_path}")
+
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.warning("Clustering step failed (%s); continuing.", exc)
 
     print("\n✓ Pipeline complete.")
 

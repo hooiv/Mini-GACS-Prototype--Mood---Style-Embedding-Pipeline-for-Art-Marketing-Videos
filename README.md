@@ -7,7 +7,11 @@ A self-contained Python pipeline that:
 3. **Embeds** each frame with OpenAI CLIP (via HuggingFace *transformers*).
 4. **Computes** pairwise cosine-similarity scores to capture the visual "vibe"
    across frames.
-5. **Visualises** results as a heatmap, retrieval grids, and a Markdown report.
+5. **Scores** frames on named affective axes (energy, warmth, complexity, …)
+   using zero-shot text-guided CLIP probing.
+6. **Clusters** frames by visual vibe using K-means + PCA projection.
+7. **Visualises** results as heatmaps, retrieval grids, radar charts, scatter
+   plots, and a Markdown report.
 
 ---
 
@@ -19,17 +23,22 @@ A self-contained Python pipeline that:
 │   ├── frame_extractor.py   # Video loading, frame extraction, metadata I/O
 │   ├── embeddings.py        # CLIP embedding computation and persistence
 │   ├── similarity.py        # Cosine-similarity matrix and top-k retrieval
-│   └── visualization.py     # Matplotlib heatmap, grids, bar chart, report
+│   ├── visualization.py     # Matplotlib heatmap, grids, bar chart, report
+│   ├── affective_scoring.py # Zero-shot text-guided affective axis scoring
+│   └── clustering.py        # K-means vibe clustering + PCA/t-SNE scatter
 ├── tests/
-│   └── test_pipeline.py     # Unit + integration tests (pytest)
+│   └── test_pipeline.py     # Unit + integration tests (pytest, 58 tests)
 ├── data/
 │   ├── videos/              # Source videos (downloaded or user-provided)
 │   ├── frames/              # Extracted frame images (auto-generated)
 │   ├── metadata/            # CSV / JSON metadata files (auto-generated)
 │   └── embeddings/          # Saved .npy embedding arrays (auto-generated)
-├── outputs/                 # Heatmap PNG, bar chart, retrieval grids, report
+├── outputs/                 # All generated visualisations and reports
+├── conftest.py              # Shared pytest fixtures (synthetic video, mock CLIP)
+├── pytest.ini               # Pytest discovery configuration
+├── notebook.ipynb           # Interactive Jupyter walkthrough (all steps)
 ├── download_videos.py       # Helper: download 3 sample CC0 videos
-├── main.py                  # End-to-end pipeline orchestrator
+├── main.py                  # End-to-end pipeline orchestrator (9 steps)
 ├── requirements.txt
 ├── README.md                # This file
 └── REPORT.md                # GenTA / GACS design discussion
@@ -77,6 +86,7 @@ Key options:
 | `--model NAME` | `openai/clip-vit-base-patch32` | HuggingFace CLIP variant |
 | `--top-k N` | `5` | Similar frames per query |
 | `--n-queries N` | `3` | Number of query frames |
+| `--n-clusters K` | `0` | Vibe clusters (0 = auto-detect) |
 | `--skip-download` | – | Skip video download step |
 | `--skip-extraction` | – | Reuse existing frames/metadata |
 | `--skip-embedding` | – | Reuse existing `.npy` embeddings |
@@ -85,10 +95,26 @@ Key options:
 
 After a successful run, `outputs/` contains:
 
-- `similarity_heatmap.png` — full pairwise cosine-similarity heatmap
-- `cross_video_similarity_bar.png` — within-video vs cross-video mean similarity
-- `top_k_query_<N>.png` — retrieval grid for each query frame
-- `similarity_report.md` — Markdown table of top-5 retrievals per query
+| File | Description |
+|------|-------------|
+| `similarity_heatmap.png` | Full pairwise cosine-similarity heatmap |
+| `cross_video_similarity_bar.png` | Within-video vs cross-video mean similarity |
+| `top_k_query_<N>.png` | Retrieval grid for each query frame |
+| `similarity_report.md` | Markdown table of top-5 retrievals per query |
+| `affective_heatmap.png` | Affective axis scores heatmap (axes × frames) |
+| `affective_radar.png` | Per-video affective profile radar chart |
+| `affective_scores.json` | Frame-level affective scores (JSON) |
+| `vibe_cluster_scatter.png` | 2-D PCA scatter of frames coloured by vibe cluster |
+| `cluster_assignments.json` | Per-frame cluster label assignments (JSON) |
+
+### 5 · Interactive Jupyter notebook
+
+```bash
+jupyter notebook notebook.ipynb
+```
+
+Runs all nine pipeline steps interactively, showing inline visualisations
+at each stage.
 
 ---
 
@@ -98,8 +124,8 @@ After a successful run, `outputs/` contains:
 python -m pytest tests/ -v
 ```
 
-The test suite uses synthetic videos and a mocked CLIP model so **no GPU
-and no internet connection are needed**.  All tests should pass in under
+The test suite (58 tests) uses synthetic videos and a mocked CLIP model so
+**no GPU and no internet connection are needed**.  All tests pass in under
 60 seconds.
 
 ---
@@ -140,6 +166,31 @@ and no internet connection are needed**.  All tests should pass in under
 | `plot_top_k_grid(...)` | Query + neighbours image grid |
 | `plot_cross_video_similarity_bar(...)` | Bar chart comparing similarity groups |
 | `generate_similarity_report(...)` | Markdown report with tables |
+
+### `src/affective_scoring.py`
+
+| Symbol | Purpose |
+|--------|---------|
+| `AffectiveScorer` | Zero-shot text-guided CLIP affective scorer |
+| `AffectiveScorer.score_frames(embeddings)` | Frame-level axis scores ``(N,)`` per axis |
+| `AffectiveScorer.score_video_level(scores, index)` | Mean-pooled per-video profile |
+| `AffectiveScorer.plot_heatmap(...)` | Axes × frames score heatmap |
+| `AffectiveScorer.plot_radar(...)` | Per-video radar chart |
+| `AffectiveScorer.save_scores(...)` | JSON export of frame-level scores |
+| `DEFAULT_AXES` | Built-in 6-axis affective taxonomy |
+
+### `src/clustering.py`
+
+| Symbol | Purpose |
+|--------|---------|
+| `VibeClusterer` | K-means + PCA/t-SNE clustering of frame embeddings |
+| `VibeClusterer.fit(embeddings)` | Fit K-means, return label array ``(N,)`` |
+| `VibeClusterer.predict(embeddings)` | Assign new frames to nearest cluster |
+| `VibeClusterer.project_2d(embeddings)` | PCA or t-SNE 2-D projection |
+| `VibeClusterer.plot_scatter(...)` | 2-D scatter plot coloured by cluster |
+| `VibeClusterer.cluster_summary(labels, index)` | Per-cluster size and video distribution |
+| `VibeClusterer.save_cluster_assignments(...)` | JSON export of per-frame labels |
+| `auto_n_clusters(embeddings)` | Elbow-heuristic k suggestion |
 
 ---
 

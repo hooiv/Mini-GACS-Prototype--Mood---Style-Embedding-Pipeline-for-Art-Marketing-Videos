@@ -10,6 +10,8 @@ Test categories
 3. Similarity        – pure NumPy; no external dependencies needed.
 4. Visualization     – checks that Matplotlib files are written correctly.
 5. Integration       – wires mock objects together end-to-end.
+6. Affective scoring – mocked CLIP text encoder; checks shape/range/NaN.
+7. Clustering        – pure NumPy + sklearn; no CLIP model needed.
 
 Run with:
     python -m pytest tests/ -v
@@ -1028,6 +1030,229 @@ class TestAffectiveScorer(unittest.TestCase):
 
         self.assertTrue(os.path.exists(result_path))
         self.assertGreater(os.path.getsize(result_path), 100)
+
+
+# ---------------------------------------------------------------------------
+# 7. Clustering tests (pure NumPy + sklearn – no CLIP model needed)
+# ---------------------------------------------------------------------------
+
+class TestVibeClusterer(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _unit_embeddings(self, n: int, dim: int = 16) -> np.ndarray:
+        rng = np.random.default_rng(123)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def _make_index(self, n: int):
+        return [
+            {"video_id": f"v{i // 5}", "frame_idx": i, "timestamp": float(i),
+             "file_path": os.path.join(self.tmp, f"frame_{i}.jpg")}
+            for i in range(n)
+        ]
+
+    # --- fit / predict ---
+
+    def test_fit_returns_correct_shape(self):
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(20)
+        clust = VibeClusterer(n_clusters=4)
+        labels = clust.fit(embs)
+
+        self.assertEqual(labels.shape, (20,))
+        self.assertEqual(labels.dtype, np.int32)
+
+    def test_fit_labels_in_range(self):
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(15)
+        clust = VibeClusterer(n_clusters=3)
+        labels = clust.fit(embs)
+
+        self.assertTrue((labels >= 0).all())
+        self.assertTrue((labels < 3).all())
+
+    def test_fit_all_clusters_represented(self):
+        """With enough frames, every cluster should have at least one frame."""
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(30)
+        clust = VibeClusterer(n_clusters=5)
+        labels = clust.fit(embs)
+
+        self.assertEqual(len(set(labels.tolist())), 5)
+
+    def test_fit_too_few_frames_raises(self):
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(3)
+        clust = VibeClusterer(n_clusters=5)
+        with self.assertRaises(ValueError):
+            clust.fit(embs)
+
+    def test_invalid_n_clusters_raises(self):
+        from src.clustering import VibeClusterer
+
+        with self.assertRaises(ValueError):
+            VibeClusterer(n_clusters=1)
+
+    def test_predict_before_fit_raises(self):
+        from src.clustering import VibeClusterer
+
+        clust = VibeClusterer(n_clusters=3)
+        embs = self._unit_embeddings(10)
+        with self.assertRaises(RuntimeError):
+            clust.predict(embs)
+
+    def test_predict_labels_in_range(self):
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(20)
+        clust = VibeClusterer(n_clusters=4)
+        clust.fit(embs)
+        new_embs = self._unit_embeddings(5, dim=16)
+        labels = clust.predict(new_embs)
+
+        self.assertEqual(labels.shape, (5,))
+        self.assertTrue((labels >= 0).all())
+        self.assertTrue((labels < 4).all())
+
+    # --- cluster_summary ---
+
+    def test_cluster_summary_keys(self):
+        from src.clustering import VibeClusterer
+
+        n = 20
+        embs = self._unit_embeddings(n)
+        index = self._make_index(n)
+        clust = VibeClusterer(n_clusters=4)
+        labels = clust.fit(embs)
+        summary = clust.cluster_summary(labels, index, embeddings=embs)
+
+        self.assertEqual(set(summary.keys()), {0, 1, 2, 3})
+        for info in summary.values():
+            self.assertIn("size", info)
+            self.assertIn("video_distribution", info)
+            self.assertIn("representative_frame_idx", info)
+
+    def test_cluster_summary_sizes_sum_to_n(self):
+        from src.clustering import VibeClusterer
+
+        n = 25
+        embs = self._unit_embeddings(n)
+        index = self._make_index(n)
+        clust = VibeClusterer(n_clusters=5)
+        labels = clust.fit(embs)
+        summary = clust.cluster_summary(labels, index, embeddings=embs)
+
+        total = sum(info["size"] for info in summary.values())
+        self.assertEqual(total, n)
+
+    def test_cluster_summary_representative_is_in_cluster(self):
+        """representative_frame_idx must belong to the correct cluster."""
+        from src.clustering import VibeClusterer
+
+        n = 20
+        embs = self._unit_embeddings(n)
+        index = self._make_index(n)
+        clust = VibeClusterer(n_clusters=4)
+        labels = clust.fit(embs)
+        summary = clust.cluster_summary(labels, index, embeddings=embs)
+
+        for k, info in summary.items():
+            rep_idx = info["representative_frame_idx"]
+            if rep_idx is not None:
+                self.assertEqual(int(labels[rep_idx]), k)
+
+    # --- project_2d ---
+
+    def test_project_2d_pca_shape(self):
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(20, dim=32)
+        clust = VibeClusterer(n_clusters=3)
+        coords = clust.project_2d(embs, method="pca")
+
+        self.assertEqual(coords.shape, (20, 2))
+        self.assertEqual(coords.dtype, np.float32)
+
+    def test_project_2d_pca_no_nan(self):
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(15, dim=16)
+        clust = VibeClusterer(n_clusters=3)
+        coords = clust.project_2d(embs, method="pca")
+
+        self.assertFalse(np.isnan(coords).any())
+
+    def test_project_2d_unknown_method_raises(self):
+        from src.clustering import VibeClusterer
+
+        clust = VibeClusterer(n_clusters=3)
+        embs = self._unit_embeddings(10)
+        with self.assertRaises(ValueError):
+            clust.project_2d(embs, method="umap_xyz")
+
+    # --- plot_scatter ---
+
+    def test_plot_scatter_creates_file(self):
+        from src.clustering import VibeClusterer
+
+        n = 20
+        embs = self._unit_embeddings(n, dim=16)
+        index = self._make_index(n)
+        clust = VibeClusterer(n_clusters=3)
+        labels = clust.fit(embs)
+
+        out = os.path.join(self.tmp, "scatter.png")
+        result_path = clust.plot_scatter(embs, labels, index, out)
+
+        self.assertTrue(os.path.exists(result_path))
+        self.assertGreater(os.path.getsize(result_path), 100)
+
+    # --- save_cluster_assignments ---
+
+    def test_save_cluster_assignments_creates_json(self):
+        from src.clustering import VibeClusterer
+
+        n = 10
+        embs = self._unit_embeddings(n)
+        index = self._make_index(n)
+        clust = VibeClusterer(n_clusters=2)
+        labels = clust.fit(embs)
+
+        out = os.path.join(self.tmp, "assignments.json")
+        result_path = clust.save_cluster_assignments(labels, index, out)
+
+        self.assertTrue(os.path.exists(result_path))
+        with open(result_path) as fh:
+            data = json.load(fh)
+        self.assertEqual(len(data), n)
+        for row in data:
+            self.assertIn("cluster", row)
+            self.assertIn(row["cluster"], [0, 1])
+
+    # --- auto_n_clusters ---
+
+    def test_auto_n_clusters_returns_valid_k(self):
+        from src.clustering import auto_n_clusters
+
+        embs = self._unit_embeddings(30, dim=16)
+        k = auto_n_clusters(embs, max_k=8)
+
+        self.assertGreaterEqual(k, 2)
+        self.assertLessEqual(k, 8)
+
+    def test_auto_n_clusters_too_few_samples_returns_2(self):
+        from src.clustering import auto_n_clusters
+
+        embs = self._unit_embeddings(3, dim=8)
+        # max_k will be clamped to n-1 = 2 → only k=2 is tested → returns 2
+        k = auto_n_clusters(embs, max_k=10)
+        self.assertEqual(k, 2)
 
 
 if __name__ == "__main__":
