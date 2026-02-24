@@ -25,9 +25,11 @@ A self-contained Python pipeline that:
 │   ├── similarity.py        # Cosine-similarity matrix and top-k retrieval
 │   ├── visualization.py     # Matplotlib heatmap, grids, bar chart, report
 │   ├── affective_scoring.py # Zero-shot text-guided affective axis scoring
-│   └── clustering.py        # K-means vibe clustering + PCA/t-SNE scatter
+│   ├── clustering.py        # K-means vibe clustering + PCA/t-SNE scatter
+│   ├── temporal_analysis.py # Temporal similarity curve, scene transitions, pacing
+│   └── performance_predictor.py  # Vibe → CTR/ROAS ridge/MLP regression
 ├── tests/
-│   └── test_pipeline.py     # Unit + integration tests (pytest, 58 tests)
+│   └── test_pipeline.py     # Unit + integration tests (pytest, 95 tests)
 ├── data/
 │   ├── videos/              # Source videos (downloaded or user-provided)
 │   ├── frames/              # Extracted frame images (auto-generated)
@@ -106,6 +108,13 @@ After a successful run, `outputs/` contains:
 | `affective_scores.json` | Frame-level affective scores (JSON) |
 | `vibe_cluster_scatter.png` | 2-D PCA scatter of frames coloured by vibe cluster |
 | `cluster_assignments.json` | Per-frame cluster label assignments (JSON) |
+| `narrative_arc.png` | Temporal similarity curve with scene transitions marked |
+| `pacing_comparison.png` | Pacing & coherence bar chart comparing videos |
+| `temporal_stats.json` | Per-frame temporal similarity scores (JSON) |
+| `predictor_cv_results.png` | Spearman ρ per CV fold bar chart |
+| `predictor_feature_importance.png` | Top feature importances (vibe → CTR) |
+| `predictor_predicted_vs_actual.png` | Scatter of predicted vs actual CTR |
+| `predictor_model.json` | Ridge model coefficients and scaler parameters |
 
 ### 5 · Interactive Jupyter notebook
 
@@ -113,7 +122,7 @@ After a successful run, `outputs/` contains:
 jupyter notebook notebook.ipynb
 ```
 
-Runs all nine pipeline steps interactively, showing inline visualisations
+Runs all eleven pipeline steps interactively, showing inline visualisations
 at each stage.
 
 ---
@@ -124,7 +133,7 @@ at each stage.
 python -m pytest tests/ -v
 ```
 
-The test suite (58 tests) uses synthetic videos and a mocked CLIP model so
+The test suite (95 tests) uses synthetic videos and a mocked CLIP model so
 **no GPU and no internet connection are needed**.  All tests pass in under
 60 seconds.
 
@@ -192,6 +201,36 @@ The test suite (58 tests) uses synthetic videos and a mocked CLIP model so
 | `VibeClusterer.save_cluster_assignments(...)` | JSON export of per-frame labels |
 | `auto_n_clusters(embeddings)` | Elbow-heuristic k suggestion |
 
+### `src/temporal_analysis.py`
+
+| Symbol | Purpose |
+|--------|---------|
+| `TemporalAnalyser` | Temporal visual-style dynamics analyser |
+| `TemporalAnalyser.compute_temporal_curve(embeddings, index)` | Per-frame neighbourhood similarity ``(N,)`` |
+| `TemporalAnalyser.detect_scene_transitions(curve, threshold)` | Indices of sharp style-change frames |
+| `TemporalAnalyser.pacing_score(curve)` | Variance of temporal curve (high = dynamic editing) |
+| `TemporalAnalyser.coherence_score(curve)` | Mean of temporal curve (high = smooth narrative) |
+| `TemporalAnalyser.per_video_stats(curve, index)` | Coherence, pacing, transitions per video |
+| `TemporalAnalyser.plot_narrative_arc(...)` | Line chart of temporal curve + transition markers |
+| `TemporalAnalyser.plot_pacing_comparison(...)` | Bar chart of pacing & coherence across videos |
+| `TemporalAnalyser.save_temporal_stats(...)` | JSON export of per-frame temporal scores |
+
+### `src/performance_predictor.py`
+
+| Symbol | Purpose |
+|--------|---------|
+| `generate_synthetic_performance_data(...)` | Synthetic CTR/ROAS labels from affective + PCA features |
+| `build_feature_names(affective_scores, n_pca)` | Consistent feature name list |
+| `VibePerformancePredictor` | Ridge / MLP predictor: vibe features → CTR/ROAS |
+| `VibePerformancePredictor.fit(features, labels)` | Train the predictor |
+| `VibePerformancePredictor.predict(features)` | Score new creatives |
+| `VibePerformancePredictor.cross_validate(...)` | K-fold Spearman ρ + RMSE evaluation |
+| `VibePerformancePredictor.feature_importance(...)` | Top-k drivers of predicted performance |
+| `VibePerformancePredictor.plot_cv_results(...)` | CV fold bar chart |
+| `VibePerformancePredictor.plot_feature_importance(...)` | Importance horizontal bar chart |
+| `VibePerformancePredictor.plot_predicted_vs_actual(...)` | Scatter plot of predicted vs actual |
+| `VibePerformancePredictor.save_model(...)` | JSON export of model coefficients |
+
 ---
 
 ## Design Notes
@@ -204,6 +243,9 @@ The test suite (58 tests) uses synthetic videos and a mocked CLIP model so
   at every stage so the pipeline is fully restartable with `--skip-*` flags.
 - The CLIP model is loaded once and reused for all batches to minimise
   memory overhead.
+- The performance predictor uses **Spearman ρ** as the evaluation metric — the
+  correct choice for ad-creative ranking systems where relative order matters
+  more than absolute values.
 
 ---
 

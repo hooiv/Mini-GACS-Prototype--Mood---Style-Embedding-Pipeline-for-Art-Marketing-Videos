@@ -12,6 +12,8 @@ Test categories
 5. Integration       – wires mock objects together end-to-end.
 6. Affective scoring – mocked CLIP text encoder; checks shape/range/NaN.
 7. Clustering        – pure NumPy + sklearn; no CLIP model needed.
+8. Temporal analysis – pure NumPy; verifies curve, transitions, pacing.
+9. Performance pred  – pure NumPy + sklearn; verifies synthetic data and predictor.
 
 Run with:
     python -m pytest tests/ -v
@@ -1253,6 +1255,523 @@ class TestVibeClusterer(unittest.TestCase):
         # max_k will be clamped to n-1 = 2 → only k=2 is tested → returns 2
         k = auto_n_clusters(embs, max_k=10)
         self.assertEqual(k, 2)
+
+
+# ---------------------------------------------------------------------------
+# 8. Temporal analysis tests  (pure NumPy – no CLIP, no GPU)
+# ---------------------------------------------------------------------------
+
+class TestTemporalAnalysis(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _unit_embeddings(self, n: int, dim: int = 16, seed: int = 7) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def _make_index(self, n: int, n_videos: int = 2):
+        frames_per_vid = n // n_videos
+        return [
+            {
+                "video_id": f"v{i // frames_per_vid}",
+                "frame_idx": i % frames_per_vid,
+                "timestamp": float(i % frames_per_vid),
+                "file_path": os.path.join(self.tmp, f"f{i}.jpg"),
+            }
+            for i in range(n)
+        ]
+
+    # --- compute_temporal_curve ---
+
+    def test_curve_shape(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(20)
+        index = self._make_index(20)
+        ta = TemporalAnalyser(window=3)
+        curve = ta.compute_temporal_curve(embs, index)
+
+        self.assertEqual(curve.shape, (20,))
+        self.assertEqual(curve.dtype, np.float32)
+
+    def test_curve_range(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(20)
+        index = self._make_index(20)
+        ta = TemporalAnalyser(window=2)
+        curve = ta.compute_temporal_curve(embs, index)
+
+        self.assertLessEqual(float(curve.max()), 1.0 + 1e-5)
+        self.assertGreaterEqual(float(curve.min()), -1.0 - 1e-5)
+
+    def test_curve_no_nan(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(15)
+        index = self._make_index(15)
+        ta = TemporalAnalyser(window=3)
+        curve = ta.compute_temporal_curve(embs, index)
+
+        self.assertFalse(np.isnan(curve).any())
+
+    def test_curve_single_frame_video(self):
+        """A video with a single frame should get score 1.0 (trivially coherent)."""
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(1)
+        index = [{"video_id": "solo", "frame_idx": 0, "timestamp": 0.0, "file_path": "x.jpg"}]
+        ta = TemporalAnalyser(window=3)
+        curve = ta.compute_temporal_curve(embs, index)
+
+        self.assertAlmostEqual(float(curve[0]), 1.0, places=5)
+
+    def test_curve_invalid_input_raises(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        ta = TemporalAnalyser(window=2)
+        with self.assertRaises(ValueError):
+            ta.compute_temporal_curve(np.zeros((0, 16)), [])
+
+    def test_window_must_be_positive(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        with self.assertRaises(ValueError):
+            TemporalAnalyser(window=0)
+
+    # --- detect_scene_transitions ---
+
+    def test_transitions_are_subset_of_indices(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        curve = np.array([0.9, 0.85, 0.3, 0.8, 0.78], dtype=np.float32)
+        ta = TemporalAnalyser(window=1)
+        transitions = ta.detect_scene_transitions(curve, threshold=0.3)
+
+        for t in transitions:
+            self.assertGreaterEqual(t, 0)
+            self.assertLess(t, len(curve))
+
+    def test_transitions_detect_big_drop(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        curve = np.array([0.9, 0.85, 0.2, 0.8, 0.78], dtype=np.float32)
+        ta = TemporalAnalyser(window=1)
+        transitions = ta.detect_scene_transitions(curve, threshold=0.4)
+
+        # Drop from 0.85 to 0.2 = 0.65 > 0.4 → should detect transition at idx 2
+        self.assertIn(2, transitions)
+
+    def test_no_transitions_on_flat_curve(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        curve = np.full(10, 0.8, dtype=np.float32)
+        ta = TemporalAnalyser(window=2)
+        transitions = ta.detect_scene_transitions(curve, threshold=0.1)
+
+        self.assertEqual(transitions, [])
+
+    def test_transitions_short_curve(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        ta = TemporalAnalyser(window=1)
+        self.assertEqual(ta.detect_scene_transitions(np.array([0.5], dtype=np.float32)), [])
+        self.assertEqual(ta.detect_scene_transitions(np.array([], dtype=np.float32)), [])
+
+    # --- pacing_score / coherence_score ---
+
+    def test_pacing_is_non_negative(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        ta = TemporalAnalyser()
+        curve = np.random.default_rng(1).random(20).astype(np.float32)
+        self.assertGreaterEqual(ta.pacing_score(curve), 0.0)
+
+    def test_coherence_in_range(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(20)
+        index = self._make_index(20)
+        ta = TemporalAnalyser(window=2)
+        curve = ta.compute_temporal_curve(embs, index)
+
+        self.assertLessEqual(ta.coherence_score(curve), 1.0 + 1e-5)
+        self.assertGreaterEqual(ta.coherence_score(curve), -1.0 - 1e-5)
+
+    def test_pacing_score_empty(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        ta = TemporalAnalyser()
+        self.assertEqual(ta.pacing_score(np.array([], dtype=np.float32)), 0.0)
+
+    def test_coherence_score_empty(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        ta = TemporalAnalyser()
+        self.assertEqual(ta.coherence_score(np.array([], dtype=np.float32)), 0.0)
+
+    # --- per_video_stats ---
+
+    def test_per_video_stats_keys(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(20)
+        index = self._make_index(20, n_videos=2)
+        ta = TemporalAnalyser(window=3)
+        curve = ta.compute_temporal_curve(embs, index)
+        stats = ta.per_video_stats(curve, index)
+
+        self.assertEqual(set(stats.keys()), {"v0", "v1"})
+        for vstats in stats.values():
+            for k in ("coherence", "pacing", "n_frames", "n_transitions"):
+                self.assertIn(k, vstats)
+
+    # --- save_temporal_stats ---
+
+    def test_save_temporal_stats_creates_json(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        n = 10
+        embs = self._unit_embeddings(n)
+        index = self._make_index(n)
+        ta = TemporalAnalyser(window=2)
+        curve = ta.compute_temporal_curve(embs, index)
+
+        out = os.path.join(self.tmp, "temporal.json")
+        path = ta.save_temporal_stats(curve, index, out)
+
+        self.assertTrue(os.path.exists(path))
+        with open(path) as fh:
+            data = json.load(fh)
+        self.assertEqual(len(data), n)
+        self.assertIn("temporal_sim", data[0])
+
+    # --- plot_narrative_arc ---
+
+    def test_plot_narrative_arc_creates_file(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        n = 20
+        embs = self._unit_embeddings(n)
+        index = self._make_index(n)
+        ta = TemporalAnalyser(window=3)
+        curve = ta.compute_temporal_curve(embs, index)
+        transitions = ta.detect_scene_transitions(curve)
+
+        out = os.path.join(self.tmp, "arc.png")
+        path = ta.plot_narrative_arc(curve, transitions, index, out)
+
+        self.assertTrue(os.path.exists(path))
+        self.assertGreater(os.path.getsize(path), 100)
+
+    # --- plot_pacing_comparison ---
+
+    def test_plot_pacing_comparison_creates_file(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(20)
+        index = self._make_index(20, n_videos=2)
+        ta = TemporalAnalyser(window=3)
+        curve = ta.compute_temporal_curve(embs, index)
+        stats = ta.per_video_stats(curve, index)
+
+        out = os.path.join(self.tmp, "pacing.png")
+        path = ta.plot_pacing_comparison(stats, out)
+
+        self.assertTrue(os.path.exists(path))
+        self.assertGreater(os.path.getsize(path), 100)
+
+
+# ---------------------------------------------------------------------------
+# 9. Performance predictor tests  (pure NumPy + sklearn – no CLIP needed)
+# ---------------------------------------------------------------------------
+
+class TestPerformancePredictor(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _unit_embeddings(self, n: int, dim: int = 16, seed: int = 11) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def _affective_scores(self, n: int, seed: int = 42):
+        rng = np.random.default_rng(seed)
+        axes = ["joy", "warmth", "energy", "luxury", "complexity", "tension"]
+        return {ax: rng.standard_normal(n).astype(np.float32) for ax in axes}
+
+    def _make_index(self, n: int):
+        return [{"video_id": f"v{i // 5}", "frame_idx": i} for i in range(n)]
+
+    # --- generate_synthetic_performance_data ---
+
+    def test_synthetic_data_shape(self):
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        n, dim = 30, 16
+        embs = self._unit_embeddings(n, dim)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        self.assertEqual(features.shape[0], n)
+        self.assertEqual(labels.shape, (n,))
+
+    def test_synthetic_labels_in_0_1(self):
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        n = 20
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        _, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        self.assertTrue((labels >= 0).all())
+        self.assertTrue((labels <= 1).all())
+
+    def test_synthetic_no_nan(self):
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        n = 20
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        self.assertFalse(np.isnan(features).any())
+        self.assertFalse(np.isnan(labels).any())
+
+    def test_synthetic_invalid_target_raises(self):
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        embs = self._unit_embeddings(10)
+        aff = self._affective_scores(10)
+        index = self._make_index(10)
+        with self.assertRaises(ValueError):
+            generate_synthetic_performance_data(embs, aff, index, target="clicks")
+
+    def test_synthetic_empty_embeddings_raises(self):
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        with self.assertRaises(ValueError):
+            generate_synthetic_performance_data(
+                np.zeros((0, 16)), {}, []
+            )
+
+    def test_roas_labels_differ_from_ctr(self):
+        """ROAS and CTR labels should use different weights → different output."""
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        n = 30
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        _, ctr = generate_synthetic_performance_data(embs, aff, index, target="ctr")
+        _, roas = generate_synthetic_performance_data(embs, aff, index, target="roas")
+
+        # They should be different (extremely unlikely to match by coincidence)
+        self.assertFalse(np.allclose(ctr, roas))
+
+    # --- VibePerformancePredictor ---
+
+    def test_invalid_model_type_raises(self):
+        from src.performance_predictor import VibePerformancePredictor
+
+        with self.assertRaises(ValueError):
+            VibePerformancePredictor(model_type="xgboost")
+
+    def test_predict_before_fit_raises(self):
+        from src.performance_predictor import VibePerformancePredictor
+
+        pred = VibePerformancePredictor()
+        with self.assertRaises(RuntimeError):
+            pred.predict(np.zeros((5, 10), dtype=np.float32))
+
+    def test_feature_importance_before_fit_raises(self):
+        from src.performance_predictor import VibePerformancePredictor
+
+        pred = VibePerformancePredictor()
+        with self.assertRaises(RuntimeError):
+            pred.feature_importance()
+
+    def test_fit_and_predict_shape(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 30
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor(model_type="ridge")
+        pred.fit(features, labels)
+        out = pred.predict(features)
+
+        self.assertEqual(out.shape, (n,))
+        self.assertEqual(out.dtype, np.float32)
+
+    def test_cross_validate_returns_spearman(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 30
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor(model_type="ridge")
+        cv = pred.cross_validate(features, labels, n_splits=3)
+
+        for key in ("mean_spearman", "std_spearman", "mean_rmse", "fold_spearman"):
+            self.assertIn(key, cv)
+        self.assertEqual(len(cv["fold_spearman"]), 3)
+        # With synthetic data generated by a linear function, ridge should do well
+        self.assertGreater(cv["mean_spearman"], 0.0)
+
+    def test_spearman_recovers_signal(self):
+        """Ridge regression should achieve Spearman ρ > 0.5 on clearly linear data."""
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 100
+        embs = self._unit_embeddings(n, dim=32, seed=0)
+        aff = self._affective_scores(n, seed=0)
+        features, labels = generate_synthetic_performance_data(
+            embs, aff, [], noise_level=0.05
+        )
+        pred = VibePerformancePredictor(model_type="ridge")
+        cv = pred.cross_validate(features, labels, n_splits=5)
+        self.assertGreater(cv["mean_spearman"], 0.5)
+
+    def test_feature_importance_returns_list(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 30
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor(model_type="ridge")
+        pred.fit(features, labels)
+        imp = pred.feature_importance(top_k=5)
+
+        self.assertEqual(len(imp), 5)
+        names, scores = zip(*imp)
+        # Sorted descending
+        self.assertEqual(list(scores), sorted(scores, reverse=True))
+
+    def test_save_model_creates_json(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 20
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor(model_type="ridge")
+        pred.fit(features, labels)
+
+        out = os.path.join(self.tmp, "model.json")
+        path = pred.save_model(out)
+
+        self.assertTrue(os.path.exists(path))
+        with open(path) as fh:
+            doc = json.load(fh)
+        self.assertIn("coef", doc)
+        self.assertEqual(doc["model_type"], "ridge")
+
+    def test_plot_cv_results_creates_file(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 20
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor()
+        cv = pred.cross_validate(features, labels, n_splits=3)
+
+        out = os.path.join(self.tmp, "cv.png")
+        path = pred.plot_cv_results(cv, out)
+
+        self.assertTrue(os.path.exists(path))
+        self.assertGreater(os.path.getsize(path), 100)
+
+    def test_plot_feature_importance_creates_file(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 20
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor()
+        pred.fit(features, labels)
+
+        out = os.path.join(self.tmp, "imp.png")
+        path = pred.plot_feature_importance(out, top_k=5)
+
+        self.assertTrue(os.path.exists(path))
+        self.assertGreater(os.path.getsize(path), 100)
+
+    def test_plot_predicted_vs_actual_creates_file(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 20
+        embs = self._unit_embeddings(n)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor()
+        pred.fit(features, labels)
+        predicted = pred.predict(features)
+
+        out = os.path.join(self.tmp, "scatter.png")
+        path = pred.plot_predicted_vs_actual(labels, predicted, out)
+
+        self.assertTrue(os.path.exists(path))
+        self.assertGreater(os.path.getsize(path), 100)
+
+    def test_mlp_predictor_fits_and_predicts(self):
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 40
+        embs = self._unit_embeddings(n, dim=32)
+        aff = self._affective_scores(n)
+        index = self._make_index(n)
+        features, labels = generate_synthetic_performance_data(embs, aff, index)
+
+        pred = VibePerformancePredictor(model_type="mlp", hidden_layers=(32, 16))
+        pred.fit(features, labels)
+        out = pred.predict(features)
+
+        self.assertEqual(out.shape, (n,))
+        self.assertFalse(np.isnan(out).any())
 
 
 if __name__ == "__main__":

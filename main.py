@@ -30,6 +30,7 @@ import argparse
 import logging
 import os
 import sys
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Configure logging before any local imports
@@ -59,6 +60,12 @@ from src.visualization import (
 )
 from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
 from src.clustering import VibeClusterer, auto_n_clusters
+from src.temporal_analysis import TemporalAnalyser
+from src.performance_predictor import (
+    generate_synthetic_performance_data,
+    build_feature_names,
+    VibePerformancePredictor,
+)
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -279,10 +286,10 @@ def main() -> None:
     # Step 8 – Affective scoring (text-guided zero-shot CLIP probing)
     # -----------------------------------------------------------------------
     logger.info("=== Step 8: Compute affective axis scores ===")
+    frame_scores: Optional[dict] = None  # None = step failed; {} = no axes configured
     try:
         scorer = AffectiveScorer(model_name=args.model, axes=DEFAULT_AXES)
         frame_scores = scorer.score_frames(embeddings, index)
-
         print("\n── Affective axis scores (mean per axis) ──")
         for axis_name, scores in frame_scores.items():
             print(f"  {axis_name:12s}: {float(scores.mean()):+.4f}")
@@ -348,6 +355,110 @@ def main() -> None:
 
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("Clustering step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 10 – Temporal analysis (narrative arc)
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 10: Temporal analysis ===")
+    try:
+        ta = TemporalAnalyser(window=3)
+        temporal_curve = ta.compute_temporal_curve(embeddings, index)
+
+        transitions = ta.detect_scene_transitions(temporal_curve, threshold=0.12)
+        pacing = ta.pacing_score(temporal_curve)
+        coherence = ta.coherence_score(temporal_curve)
+
+        print(f"\n── Temporal analysis ──")
+        print(f"  Coherence score:     {coherence:+.4f}  (higher = smoother narrative)")
+        print(f"  Pacing score:        {pacing:.6f}  (higher = more dynamic editing)")
+        print(f"  Scene transitions:   {len(transitions)} detected at frames {transitions[:10]}")
+        print()
+
+        per_vid_stats = ta.per_video_stats(temporal_curve, index)
+        for vid, vstats in per_vid_stats.items():
+            print(f"  {vid}: coherence={vstats['coherence']:.3f}, "
+                  f"pacing={vstats['pacing']:.5f}, "
+                  f"transitions={int(vstats['n_transitions'])}")
+        print()
+
+        arc_path = ta.plot_narrative_arc(
+            temporal_curve, transitions, index,
+            output_path=os.path.join(OUTPUTS_DIR, "narrative_arc.png"),
+        )
+        print(f"  Narrative arc: {arc_path}")
+
+        pacing_path = ta.plot_pacing_comparison(
+            per_vid_stats,
+            output_path=os.path.join(OUTPUTS_DIR, "pacing_comparison.png"),
+        )
+        print(f"  Pacing chart:  {pacing_path}")
+
+        temporal_json = ta.save_temporal_stats(
+            temporal_curve, index,
+            output_path=os.path.join(OUTPUTS_DIR, "temporal_stats.json"),
+        )
+        print(f"  Temporal JSON: {temporal_json}")
+
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.warning("Temporal analysis step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 11 – Vibe–Performance Regression (synthetic CTR prediction)
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 11: Vibe–performance regression ===")
+    try:
+        if frame_scores is None:
+            logger.warning("No affective scores available (step 8 failed); skipping predictor.")
+        else:
+            features, ctr_labels = generate_synthetic_performance_data(
+                embeddings, frame_scores, index, target="ctr"
+            )
+            n_pca = features.shape[1] - len(frame_scores)
+            feat_names = build_feature_names(frame_scores, n_pca)
+
+            predictor = VibePerformancePredictor(model_type="ridge")
+            cv_results = predictor.cross_validate(features, ctr_labels, n_splits=5)
+
+            print(f"\n── Vibe → CTR predictor (ridge, 5-fold CV) ──")
+            print(f"  Spearman ρ:  {cv_results['mean_spearman']:.4f} "
+                  f"± {cv_results['std_spearman']:.4f}")
+            print(f"  RMSE:        {cv_results['mean_rmse']:.4f} "
+                  f"± {cv_results['std_rmse']:.4f}")
+
+            predictor.fit(features, ctr_labels, feature_names=feat_names)
+            importance = predictor.feature_importance(top_k=6)
+            print("\n  Top feature importances (vibe → CTR):")
+            for fname, score in importance:
+                print(f"    {fname:20s}: {score:.4f}")
+            print()
+
+            cv_chart = predictor.plot_cv_results(
+                cv_results,
+                output_path=os.path.join(OUTPUTS_DIR, "predictor_cv_results.png"),
+                title="CTR Predictor — Spearman ρ per Fold",
+            )
+            print(f"  CV chart:          {cv_chart}")
+
+            imp_chart = predictor.plot_feature_importance(
+                output_path=os.path.join(OUTPUTS_DIR, "predictor_feature_importance.png"),
+                feature_names=feat_names,
+            )
+            print(f"  Importance chart:  {imp_chart}")
+
+            predicted_ctr = predictor.predict(features)
+            scatter_chart = predictor.plot_predicted_vs_actual(
+                ctr_labels, predicted_ctr,
+                output_path=os.path.join(OUTPUTS_DIR, "predictor_predicted_vs_actual.png"),
+            )
+            print(f"  Pred vs actual:    {scatter_chart}")
+
+            model_json = predictor.save_model(
+                output_path=os.path.join(OUTPUTS_DIR, "predictor_model.json"),
+            )
+            print(f"  Model JSON:        {model_json}")
+
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.warning("Performance regression step failed (%s); continuing.", exc)
 
     print("\n✓ Pipeline complete.")
 
