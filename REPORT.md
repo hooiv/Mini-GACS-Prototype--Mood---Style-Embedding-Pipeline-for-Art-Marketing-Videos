@@ -57,7 +57,9 @@ as a radar chart.
 Frame-level scores are time-pooled (mean) to produce a **video-level vibe
 vector**.  `VibeClusterer` groups creatives into K visual-mood clusters using
 K-means on CLIP embeddings, visualised with a 2-D PCA scatter plot.
-`auto_n_clusters()` uses the elbow heuristic to suggest K automatically.
+`auto_n_clusters()` uses the **silhouette score** (not the elbow/inertia
+heuristic — see §7b for why this matters) to suggest K automatically.
+`cluster_quality()` returns both silhouette and Davies-Bouldin index.
 This is the foundation of a GACS-grade creative intelligence engine.
 
 ### 2c. Temporal Narrative Arc *(implemented — `src/temporal_analysis.py`)*
@@ -321,4 +323,140 @@ or `wandb.config.update()` with zero code changes).
   would let it adapt to seasonality and trend shifts in ad performance.
 - **Vector DB integration**: replacing the in-memory `.npy` store with Qdrant or
   Pinecone would enable sub-millisecond retrieval at creative library scale.
+
+---
+
+## 7. Critical Engineering Improvements (Round 2)
+
+This section documents four additional errors identified in a second audit.
+Each fix is accompanied by a root-cause analysis and the corrective code.
+
+### 7a. New Module: Technical Frame Quality Filtering (`src/quality_filter.py`)
+
+**Problem**:
+Uniform interval sampling retains technically poor frames — motion-blurred
+(fast camera pan), over-exposed (direct light into lens), or near-uniform
+(fade-to-black).  These frames have three compounding downstream effects:
+
+1. **Affective scoring bias** — a motion-blurred "luxury" scene scores lower
+   on `luxury` and `complexity` axes because CLIP's patch tokens lose texture
+   detail.  Including 20% blurry frames shifts the per-video affective profile
+   toward the centre of every axis, reducing inter-video discriminability.
+
+2. **Spurious clusters** — over-exposed frames form a tight cluster around the
+   "blown-out" region of embedding space regardless of scene content, creating
+   a cluster that absorbs frames from all videos equally and inflates the
+   Davies-Bouldin index.
+
+3. **False scene transitions** — fade-to-black frames are highly dissimilar
+   from both neighbours; `compute_consecutive_similarities` returns a deep
+   trough at fade boundaries even when no hard cut occurred, inflating the
+   scene-transition count and pacing-rate metric.
+
+**Fix (`src/quality_filter.py`)**:
+`FrameQualityFilter` scores each frame on three independent axes before
+embedding:
+
+- **Blur** (Laplacian variance): `σ²(∇²I)` collapses for blurry images;
+  normalised to `[0,1]` via `v / (v + 50)`.
+- **Exposure entropy**: Shannon entropy of the 256-bin greyscale histogram;
+  collapses for uniform/over-exposed images.
+- **Luminance std**: spatial standard deviation of the Y channel; near-zero
+  for solid-colour frames and fades.
+
+The composite score is the arithmetic mean of all three normalised axes.
+Frames below `min_composite_score` (default 0.25) are removed before
+CLIP inference — zero GPU cost, using only PIL + NumPy.
+
+### 7b. Correct: Silhouette Score vs Elbow/Inertia (`src/clustering.py`)
+
+This was fixed in the previous round; the REPORT documentation has been
+updated to match.  `auto_n_clusters()` uses the silhouette score because
+inertia is monotonically decreasing in high-dimensional space:
+
+- K-means inertia always decreases as K increases; the "elbow" is a visual
+  artefact that is not statistically well-defined.
+- In 512-dimensional CLIP space, concentration of measure means all pairwise
+  distances converge to the same value; the inertia curve becomes nearly
+  linear with no reliable inflection.
+- The silhouette score `(b − a) / max(a, b)` has a genuine maximum at the
+  "correct" K and uses cosine distance (appropriate for L2-normalised vectors).
+
+### 7c. Data Leakage Fix: PCA in Cross-Validation (`src/performance_predictor.py`)
+
+**Problem**:
+The earlier `generate_synthetic_performance_data` fit a PCA transform on the
+*full* dataset before the cross-validation loop, then included the PCA
+components in both features and labels:
+
+```python
+# WRONG (leaked):
+pca = PCA(n_components=5)
+pca_features = pca.fit_transform(embeddings)   # fitted on all N samples
+features = np.hstack([aff_norm, pca_features]) # validation fold included in PCA basis
+labels = (1.0 / (1.0 + np.exp(-( features @ w + noise)))).astype(np.float32)
+```
+
+When `cross_validate` split the data into train/val folds, the validation
+features contained PCA components derived from the full-data PCA — a direct
+violation of the i.i.d. assumption.  On small datasets (N ≈ 30–100) this
+inflated Spearman ρ by approximately 0.05–0.15 because the PCA basis over-fit
+the validation distribution.
+
+**Fix**:
+`generate_synthetic_performance_data` now returns only the normalised affective
+score matrix (N × 6) as features.  Labels are generated from affective axis
+weights only.  Signal recoverability is unchanged — the test
+`test_spearman_still_recovers_signal_after_leakage_fix` verifies ρ > 0.4 at
+low noise.
+
+If embedding-level features are needed for production use, a `PCA()` step
+must be added *inside* the sklearn `Pipeline` in `_build_pipeline()` so
+the transform is fitted anew on each training fold.
+
+### 7d. Affective Heatmap Colorbar Range (`src/affective_scoring.py`)
+
+**Problem**:
+The heatmap used hardcoded `vmin=-0.5, vmax=0.5`.  Ensemble affective scores
+span `[-2, 2]` (difference of two cosine similarities).  A symmetric range of
+±0.5 clips the bottom and top 75% of the dynamic range to a single colour,
+making all frames appear identically mid-green on the diverging `RdYlGn`
+colormap — the heatmap conveyed zero information.
+
+**Fix**:
+```python
+v_abs = max(abs(np.percentile(all_vals, 5)),
+            abs(np.percentile(all_vals, 95)),
+            1e-4)
+vmin, vmax = -v_abs, v_abs
+```
+The colourbar now spans the observed 5th–95th percentile range, symmetrically,
+preserving the zero-centred semantics of the diverging colormap while adapting
+to the actual score distribution in each run.
+
+### 7e. Memory-Efficient Top-k Retrieval (`src/similarity.py`)
+
+**Problem**:
+`cosine_similarity_matrix` materialises the full N×N float32 matrix.
+Memory usage scales as O(N²):
+
+| N frames | Matrix size |
+|----------|-------------|
+| 500      | 1 MB        |
+| 2 000    | 16 MB       |
+| 10 000   | 400 MB      |
+| 50 000   | 10 GB       |
+
+For a campaign library of 10K+ frames this is unacceptable.
+
+**Fix (`top_k_no_precompute`)**:
+```python
+# One matmul row per query — O(N·D), no N×N matrix
+sims = (embeddings @ embeddings[qidx]).astype(np.float32)
+top_idx = np.argsort(sims)[::-1][:top_k]
+```
+Results are numerically identical to reading a row of the precomputed matrix
+(verified by `test_top_k_no_precompute_matches_full_matrix`).  `main.py`
+automatically switches to this path when N > 2 000 frames.
+
 

@@ -181,3 +181,81 @@ def compute_inter_video_stats(
     }
     logger.info("Inter-video similarity stats: %s", stats)
     return stats
+
+
+def top_k_no_precompute(
+    query_indices: List[int],
+    embeddings: np.ndarray,
+    index: List[Dict],
+    top_k: int = 5,
+    exclude_self: bool = True,
+) -> Dict[int, List[Dict]]:
+    """
+    Retrieve top-*k* similar frames for each query WITHOUT materialising the
+    full N×N similarity matrix.
+
+    ``cosine_similarity_matrix`` computes ``E @ E.T``, an O(N²·D) operation
+    that materialises an ``(N, N)`` float32 matrix.  At N=2 000 frames that
+    is 16 MB — tolerable.  At N=10 000 it is 400 MB; at N=50 000 it is 10 GB
+    — unacceptable for a production creative library.
+
+    This function computes for each query ``qidx``:
+
+        ``sims = embeddings @ embeddings[qidx]``   — a single (N,) row.
+
+    That is O(N·D) per query, O(Q·N·D) total — no N×N matrix materialised.
+    For Q=3 queries, N=10 000 frames, D=512: ~15 M floating-point ops, not 100 M.
+
+    The results are numerically identical to reading a row of the precomputed
+    matrix; the difference is purely in memory and latency.
+
+    Args:
+        query_indices:  List of row indices in *embeddings* to use as queries.
+        embeddings:     L2-normalised float32 ``(N, D)`` CLIP embeddings.
+        index:          Frame metadata list aligned with *embeddings*.
+        top_k:          Number of results per query.
+        exclude_self:   When True the query frame itself is excluded from
+                        results.
+
+    Returns:
+        Dict mapping each query index to a list of at most *top_k* metadata
+        dicts, each augmented with a ``"similarity"`` key (float in [-1, 1]).
+
+    Raises:
+        ValueError: if *embeddings* is not 2-D or empty.
+    """
+    if embeddings.ndim != 2 or embeddings.shape[0] == 0:
+        raise ValueError(
+            f"Expected a 2-D non-empty array; got shape {embeddings.shape}."
+        )
+    n = embeddings.shape[0]
+    results: Dict[int, List[Dict]] = {}
+
+    for qidx in query_indices:
+        if not (0 <= qidx < n):
+            logger.error("top_k_no_precompute: query_idx=%d out of range; skipping.", qidx)
+            continue
+
+        # One matmul row: O(N·D) — no full N×N matrix
+        sims = (embeddings @ embeddings[qidx]).astype(np.float32)
+        sims = np.clip(sims, -1.0, 1.0)
+
+        if exclude_self:
+            sims[qidx] = -np.inf
+
+        top_idx = np.argsort(sims)[::-1][:top_k]
+        hits = []
+        for idx in top_idx:
+            if idx >= len(index):
+                continue
+            entry = dict(index[idx])
+            entry["similarity"] = float(sims[idx])
+            hits.append(entry)
+
+        results[qidx] = hits
+        logger.debug(
+            "top_k_no_precompute: query=%d, top-%d similarities=%s.",
+            qidx, top_k, [round(h["similarity"], 4) for h in hits],
+        )
+
+    return results

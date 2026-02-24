@@ -498,8 +498,17 @@ class AffectiveScorer:
             for i, e in enumerate(index)
         ]
 
+        # Use robust percentile-based colour range.
+        # Hardcoding vmin/vmax=-0.5/0.5 clips 75% of the [-2, 2] dynamic
+        # range of ensemble scores, washing all frames to the same mid-colour.
+        all_vals = matrix.ravel()
+        v_abs = max(abs(float(np.percentile(all_vals, 5))),
+                    abs(float(np.percentile(all_vals, 95))),
+                    1e-4)
+        vmin, vmax = -v_abs, v_abs
+
         fig, ax = plt.subplots(figsize=figsize)
-        im = ax.imshow(matrix, cmap="RdYlGn", vmin=-0.5, vmax=0.5, aspect="auto")
+        im = ax.imshow(matrix, cmap="RdYlGn", vmin=vmin, vmax=vmax, aspect="auto")
         plt.colorbar(im, ax=ax, label="Affective Score (pos − neg)")
 
         ax.set_yticks(range(len(axis_names)))

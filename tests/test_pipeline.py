@@ -2159,5 +2159,301 @@ class TestSeniorImprovements(unittest.TestCase):
                              f"Axis '{axis}' must have exactly 5 negative prompts")
 
 
+# ---------------------------------------------------------------------------
+# 13. Quality filter tests  (PIL + NumPy — no CLIP needed)
+# ---------------------------------------------------------------------------
+
+class TestQualityFilter(unittest.TestCase):
+    """Tests for src/quality_filter.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _save_image(self, filename: str, pixels: np.ndarray) -> str:
+        """Save a uint8 (H, W, 3) or (H, W) numpy array as JPEG."""
+        path = os.path.join(self.tmp, filename)
+        if pixels.ndim == 3:
+            img = Image.fromarray(pixels.astype(np.uint8), mode="RGB")
+        else:
+            img = Image.fromarray(pixels.astype(np.uint8), mode="L")
+        img.save(path, "JPEG")
+        return path
+
+    def _sharp_frame(self, size: int = 64) -> np.ndarray:
+        """Create a checkerboard pattern — high Laplacian variance (sharp)."""
+        arr = np.zeros((size, size, 3), dtype=np.uint8)
+        for i in range(size):
+            for j in range(size):
+                if (i // 4 + j // 4) % 2 == 0:
+                    arr[i, j] = [200, 50, 100]
+                else:
+                    arr[i, j] = [30, 180, 220]
+        return arr
+
+    def _blurry_frame(self, size: int = 64) -> np.ndarray:
+        """Create a near-uniform grey image — low Laplacian variance (blurry)."""
+        return np.full((size, size, 3), 128, dtype=np.uint8)
+
+    def _overexposed_frame(self, size: int = 64) -> np.ndarray:
+        """Create a near-white image — collapsed histogram (over-exposed)."""
+        return np.full((size, size, 3), 250, dtype=np.uint8)
+
+    # --- blur_score ---
+
+    def test_blur_score_sharp_vs_blurry(self):
+        """Sharp checkerboard should score higher than uniform grey."""
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter()
+        sharp = self._sharp_frame()[:, :, 0]   # greyscale
+        blurry = self._blurry_frame()[:, :, 0]
+
+        s_sharp  = qf.blur_score(sharp)
+        s_blurry = qf.blur_score(blurry)
+
+        self.assertGreater(s_sharp, s_blurry,
+                           "Sharp frame should have higher blur_score than blurry frame")
+
+    def test_blur_score_range(self):
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter()
+        grey = np.random.randint(0, 256, (32, 32), dtype=np.uint8)
+        score = qf.blur_score(grey)
+        self.assertGreaterEqual(score, 0.0)
+        self.assertLessEqual(score, 1.0)
+
+    # --- exposure_entropy ---
+
+    def test_exposure_entropy_high_for_diverse_image(self):
+        """A random-pixel image should have high histogram entropy."""
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter()
+        random_img = np.random.randint(0, 256, (64, 64), dtype=np.uint8)
+        uniform_img = np.full((64, 64), 200, dtype=np.uint8)
+
+        self.assertGreater(qf.exposure_entropy(random_img),
+                           qf.exposure_entropy(uniform_img),
+                           "Diverse image should have higher entropy than uniform image")
+
+    def test_exposure_entropy_near_zero_for_uniform(self):
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter()
+        uniform = np.full((32, 32), 200, dtype=np.uint8)
+        entropy = qf.exposure_entropy(uniform)
+        self.assertAlmostEqual(entropy, 0.0, places=5)
+
+    # --- score_frames on metadata list ---
+
+    def test_score_frames_returns_correct_keys_and_shape(self):
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter()
+        paths = [
+            self._save_image("sharp.jpg", self._sharp_frame()),
+            self._save_image("blurry.jpg", self._blurry_frame()),
+        ]
+        metadata = [{"file_path": p} for p in paths]
+        scores = qf.score_frames(metadata)
+
+        for key in ("blur", "exposure_entropy", "luminance_std", "composite"):
+            self.assertIn(key, scores)
+            self.assertEqual(scores[key].shape, (2,))
+
+    def test_score_frames_missing_file_returns_zeros(self):
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter()
+        metadata = [{"file_path": "/nonexistent/missing.jpg"}]
+        scores = qf.score_frames(metadata)
+        self.assertEqual(float(scores["composite"][0]), 0.0)
+
+    # --- filter_frames ---
+
+    def test_filter_frames_removes_low_quality(self):
+        """Near-uniform frame should be filtered out at default threshold."""
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter(min_composite_score=0.35)
+        paths = [
+            self._save_image("sharp.jpg", self._sharp_frame()),
+            self._save_image("blurry.jpg", self._blurry_frame()),
+        ]
+        metadata = [{"file_path": p, "id": i} for i, p in enumerate(paths)]
+        scores = qf.score_frames(metadata)
+        clean, mask = qf.filter_frames(metadata, scores)
+
+        # blurry frame should be removed; sharp frame retained
+        self.assertGreater(len(clean), 0)
+        self.assertLess(len(clean), len(metadata))
+
+    def test_filter_frames_zero_threshold_keeps_all(self):
+        from src.quality_filter import FrameQualityFilter
+
+        qf = FrameQualityFilter(min_composite_score=0.0)
+        paths = [self._save_image(f"f{i}.jpg", self._blurry_frame()) for i in range(3)]
+        metadata = [{"file_path": p} for p in paths]
+        scores = qf.score_frames(metadata)
+        clean, mask = qf.filter_frames(metadata, scores)
+
+        self.assertEqual(len(clean), 3)
+
+    def test_invalid_min_composite_score_raises(self):
+        from src.quality_filter import FrameQualityFilter
+
+        with self.assertRaises(ValueError):
+            FrameQualityFilter(min_composite_score=1.5)
+        with self.assertRaises(ValueError):
+            FrameQualityFilter(min_composite_score=-0.1)
+
+
+# ---------------------------------------------------------------------------
+# 14. Efficient retrieval tests (no precomputed matrix)
+# ---------------------------------------------------------------------------
+
+class TestEfficientRetrieval(unittest.TestCase):
+    """Tests for top_k_no_precompute in src/similarity.py."""
+
+    @staticmethod
+    def _unit_embeddings(n: int, dim: int = 8, seed: int = 42) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    @staticmethod
+    def _make_index(n: int) -> list:
+        return [{"video_id": f"v{i % 2}", "frame_idx": i} for i in range(n)]
+
+    def test_top_k_no_precompute_matches_full_matrix(self):
+        """top_k_no_precompute must return same results as batch_top_k_queries."""
+        from src.similarity import (
+            cosine_similarity_matrix,
+            batch_top_k_queries,
+            top_k_no_precompute,
+        )
+        embs = self._unit_embeddings(10)
+        idx  = self._make_index(10)
+        sim  = cosine_similarity_matrix(embs)
+
+        queries = [0, 4, 9]
+        full_results = batch_top_k_queries(queries, sim, idx, top_k=3)
+        eff_results  = top_k_no_precompute(queries, embs, idx, top_k=3)
+
+        for qidx in queries:
+            full_sims = [r["similarity"] for r in full_results[qidx]]
+            eff_sims  = [r["similarity"] for r in eff_results[qidx]]
+            for fs, es in zip(full_sims, eff_sims):
+                self.assertAlmostEqual(fs, es, places=4,
+                    msg=f"Mismatch at query={qidx}: full={fs} vs eff={es}")
+
+    def test_top_k_no_precompute_excludes_self(self):
+        """Query frame itself should not appear in the results."""
+        from src.similarity import top_k_no_precompute
+
+        embs = self._unit_embeddings(8)
+        idx  = self._make_index(8)
+        results = top_k_no_precompute([3], embs, idx, top_k=5, exclude_self=True)
+        frame_indices = [r["frame_idx"] for r in results[3]]
+        self.assertNotIn(3, frame_indices)
+
+    def test_top_k_no_precompute_shape(self):
+        from src.similarity import top_k_no_precompute
+
+        embs = self._unit_embeddings(12)
+        idx  = self._make_index(12)
+        results = top_k_no_precompute([0, 5, 11], embs, idx, top_k=4)
+
+        self.assertEqual(len(results), 3)
+        for qidx, hits in results.items():
+            self.assertLessEqual(len(hits), 4)
+            for h in hits:
+                self.assertIn("similarity", h)
+                self.assertGreaterEqual(h["similarity"], -1.0)
+                self.assertLessEqual(h["similarity"], 1.0)
+
+    def test_top_k_no_precompute_invalid_input_raises(self):
+        from src.similarity import top_k_no_precompute
+
+        with self.assertRaises(ValueError):
+            top_k_no_precompute([0], np.zeros((0, 8), dtype=np.float32), [])
+
+
+# ---------------------------------------------------------------------------
+# 15. CV data-leakage fix tests
+# ---------------------------------------------------------------------------
+
+class TestCVLeakageFix(unittest.TestCase):
+    """Verify that generate_synthetic_performance_data no longer leaks PCA."""
+
+    @staticmethod
+    def _unit_embeddings(n: int, dim: int = 16) -> np.ndarray:
+        rng = np.random.default_rng(7)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def test_features_contain_only_affective_axes(self):
+        """Feature matrix should have exactly as many columns as affective axes."""
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        axes = ["joy", "warmth", "energy", "luxury", "complexity", "tension"]
+        n = 30
+        embs = self._unit_embeddings(n)
+        rng = np.random.default_rng(0)
+        aff = {a: rng.standard_normal(n).astype(np.float32) for a in axes}
+
+        features, labels = generate_synthetic_performance_data(embs, aff, [])
+
+        self.assertEqual(features.shape[1], len(axes),
+                         "Features must be affective-only — no PCA columns")
+
+    def test_build_feature_names_returns_axes_only(self):
+        """build_feature_names should return just axis names (no pca_0 etc.)."""
+        from src.performance_predictor import build_feature_names
+
+        axes = ["joy", "warmth", "energy"]
+        rng = np.random.default_rng(0)
+        aff = {a: rng.standard_normal(10).astype(np.float32) for a in axes}
+        names = build_feature_names(aff)
+
+        self.assertEqual(names, axes)
+        self.assertNotIn("pca_0", names)
+
+    def test_build_feature_names_backward_compat_n_pca(self):
+        """Passing n_pca to build_feature_names should not crash (ignored)."""
+        from src.performance_predictor import build_feature_names
+
+        axes = ["joy", "warmth"]
+        rng = np.random.default_rng(0)
+        aff = {a: rng.standard_normal(5).astype(np.float32) for a in axes}
+        # n_pca parameter accepted but silently ignored
+        names = build_feature_names(aff, n_pca=5)
+        self.assertEqual(names, axes)
+        # Verify n_pca=5 did NOT append any pca_* columns
+        self.assertEqual(len(names), len(axes))
+
+    def test_spearman_still_recovers_signal_after_leakage_fix(self):
+        """Ridge regression must still achieve ρ > 0.4 with affective features only."""
+        from src.performance_predictor import (
+            generate_synthetic_performance_data,
+            VibePerformancePredictor,
+        )
+        n = 120
+        embs = self._unit_embeddings(n)
+        rng = np.random.default_rng(1)
+        axes = ["joy", "warmth", "energy", "luxury", "complexity", "tension"]
+        aff = {a: rng.standard_normal(n).astype(np.float32) for a in axes}
+
+        features, labels = generate_synthetic_performance_data(
+            embs, aff, [], noise_level=0.1
+        )
+        pred = VibePerformancePredictor(model_type="ridge")
+        cv = pred.cross_validate(features, labels, n_splits=5)
+
+        self.assertGreater(cv["mean_spearman"], 0.4,
+                           "Spearman ρ should be > 0.4 even without PCA features")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

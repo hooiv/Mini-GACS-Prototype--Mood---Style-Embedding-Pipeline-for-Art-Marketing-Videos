@@ -20,16 +20,19 @@ A self-contained Python pipeline that:
 ```
 .
 ├── src/
-│   ├── frame_extractor.py   # Video loading, frame extraction, metadata I/O
-│   ├── embeddings.py        # CLIP embedding computation and persistence
-│   ├── similarity.py        # Cosine-similarity matrix and top-k retrieval
-│   ├── visualization.py     # Matplotlib heatmap, grids, bar chart, report
-│   ├── affective_scoring.py # Zero-shot text-guided affective axis scoring
-│   ├── clustering.py        # K-means vibe clustering + PCA/t-SNE scatter
-│   ├── temporal_analysis.py # Temporal similarity curve, scene transitions, pacing
-│   └── performance_predictor.py  # Vibe → CTR/ROAS ridge/MLP regression
+│   ├── frame_extractor.py    # Video loading, frame extraction, metadata I/O
+│   ├── embeddings.py         # CLIP embedding computation and persistence
+│   ├── similarity.py         # Cosine-similarity matrix, top-k retrieval, memory-efficient retrieval
+│   ├── visualization.py      # Matplotlib heatmap, grids, bar chart, report
+│   ├── affective_scoring.py  # Zero-shot text-guided affective axis scoring (multi-prompt ensemble)
+│   ├── clustering.py         # K-means vibe clustering + PCA/t-SNE scatter (silhouette quality)
+│   ├── temporal_analysis.py  # Temporal similarity curve, consecutive-sim scene transitions, pacing
+│   ├── performance_predictor.py  # Vibe → CTR/ROAS ridge/MLP regression (CV leakage-free)
+│   ├── frame_deduplication.py    # Greedy cosine-threshold dedup + MMR diverse selection
+│   ├── quality_filter.py         # Technical frame quality scoring: blur, exposure, luminance
+│   └── experiment_manifest.py    # Structured run manifest for reproducibility
 ├── tests/
-│   └── test_pipeline.py     # Unit + integration tests (pytest, 95 tests)
+│   └── test_pipeline.py     # Unit + integration tests (pytest, 135 tests)
 ├── data/
 │   ├── videos/              # Source videos (downloaded or user-provided)
 │   ├── frames/              # Extracted frame images (auto-generated)
@@ -40,7 +43,7 @@ A self-contained Python pipeline that:
 ├── pytest.ini               # Pytest discovery configuration
 ├── notebook.ipynb           # Interactive Jupyter walkthrough (all steps)
 ├── download_videos.py       # Helper: download 3 sample CC0 videos
-├── main.py                  # End-to-end pipeline orchestrator (9 steps)
+├── main.py                  # End-to-end pipeline orchestrator (12 steps)
 ├── requirements.txt
 ├── README.md                # This file
 └── REPORT.md                # GenTA / GACS design discussion

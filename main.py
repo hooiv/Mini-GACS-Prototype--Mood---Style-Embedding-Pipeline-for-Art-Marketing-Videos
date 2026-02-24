@@ -10,6 +10,7 @@ Steps
 2.  Extract frames from all videos found in ``data/videos/``.
 3.  Compute CLIP embeddings for all frames.
 3b. Content-adaptive deduplication — remove near-duplicate frames.
+3c. Technical quality filtering — remove blurry/over-exposed/uniform frames.
 4.  Calculate pairwise cosine-similarity matrix.
 5.  Run top-5 retrieval for at least 3 query frames.
 6.  Generate visualisations (heatmap, bar chart, retrieval grids).
@@ -57,6 +58,7 @@ from src.similarity import (
     cosine_similarity_matrix,
     batch_top_k_queries,
     compute_inter_video_stats,
+    top_k_no_precompute,
 )
 from src.visualization import (
     plot_similarity_heatmap,
@@ -73,6 +75,7 @@ from src.performance_predictor import (
     VibePerformancePredictor,
 )
 from src.frame_deduplication import deduplicate_frames
+from src.quality_filter import FrameQualityFilter
 from src.experiment_manifest import PipelineManifest
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,10 @@ FRAMES_DIR = os.path.join(DATA_DIR, "frames")
 METADATA_DIR = os.path.join(DATA_DIR, "metadata")
 EMBEDDINGS_DIR = os.path.join(DATA_DIR, "embeddings")
 OUTPUTS_DIR = "outputs"
+
+# N above which the full N×N similarity matrix is skipped in favour of
+# top_k_no_precompute (O(N·D) per query, avoids materialising 400 MB+).
+LARGE_N_MATRIX_THRESHOLD = 2000
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +160,17 @@ def parse_args() -> argparse.Namespace:
             "(default: 0.97).  Set to 1.0 to disable deduplication."
         ),
     )
+    p.add_argument(
+        "--min-quality-score",
+        type=float,
+        default=0.25,
+        metavar="Q",
+        help=(
+            "Minimum composite quality score [0, 1] for a frame to pass "
+            "the technical quality filter (blur + exposure + information). "
+            "Set to 0.0 to disable quality filtering (default: 0.25)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -166,6 +184,7 @@ def main() -> None:
             "interval_seconds": args.interval,
             "max_frames": args.max_frames,
             "dedup_threshold": args.dedup_threshold,
+            "min_quality_score": args.min_quality_score,
             "n_clusters_arg": args.n_clusters,
         }
     )
@@ -278,20 +297,76 @@ def main() -> None:
         logger.info("Deduplication skipped (--dedup-threshold=1.0).")
 
     # -----------------------------------------------------------------------
-    # Step 4 – Compute pairwise similarity
+    # Step 3c – Technical quality filtering
+    #
+    # Remove frames that are motion-blurred, over/under-exposed, or near-
+    # uniform (fade-to-black/white).  Such frames:
+    #   • Bias video-level affective scores (blurry frames score lower on
+    #     "luxury" and "complexity" even for inherently high-scoring content).
+    #   • Create spurious "blown-out" or "fade" clusters unrelated to style.
+    #   • Trigger false scene transitions in temporal analysis.
+    # This step runs on CPU with PIL/NumPy — negligible vs CLIP inference.
     # -----------------------------------------------------------------------
-    logger.info("=== Step 4: Compute pairwise cosine similarity ===")
-    sim_matrix = cosine_similarity_matrix(embeddings)
-    print(f"── Similarity matrix: {sim_matrix.shape}, "
-          f"range=[{sim_matrix.min():.4f}, {sim_matrix.max():.4f}] ──\n")
+    logger.info("=== Step 3c: Technical quality filtering (min_score=%.2f) ===",
+                args.min_quality_score)
+    if args.min_quality_score > 0.0:
+        quality_filter = FrameQualityFilter(
+            min_composite_score=args.min_quality_score
+        )
+        quality_scores = quality_filter.score_frames(index)
+        n_before_qf = len(index)
+        index, qf_mask = quality_filter.filter_frames(index, quality_scores)
+        # Keep embeddings aligned with filtered index
+        embeddings = embeddings[qf_mask]
+        n_after_qf = len(index)
+        print(
+            f"\n── Quality filter: kept {n_after_qf} / {n_before_qf} frames "
+            f"({100.0 * n_after_qf / max(n_before_qf, 1):.1f}%) ──\n"
+        )
+        manifest.record(
+            "quality_filter",
+            min_composite_score=args.min_quality_score,
+            n_before=n_before_qf,
+            n_after=n_after_qf,
+            reduction_pct=round(
+                100.0 * (n_before_qf - n_after_qf) / max(n_before_qf, 1), 2
+            ),
+        )
+    else:
+        logger.info("Quality filtering skipped (--min-quality-score=0.0).")
 
-    stats = compute_inter_video_stats(sim_matrix, index)
-    print("── Similarity stats ──")
-    for k, v in stats.items():
-        print(f"  {k}: {v:.4f}")
-    print()
+    # -----------------------------------------------------------------------
+    # Step 4 – Compute pairwise similarity
+    #
+    # For N ≤ 2000 frames we precompute the full N×N matrix (16 MB).
+    # For larger datasets we use top_k_no_precompute which materialises only
+    # one O(N) row per query instead of the full O(N²) matrix.
+    # -----------------------------------------------------------------------
+    _LARGE_N = embeddings.shape[0]
 
-    manifest.record("similarity", **stats, n_frames=len(index))
+    if _LARGE_N <= LARGE_N_MATRIX_THRESHOLD:
+        sim_matrix = cosine_similarity_matrix(embeddings)
+        print(f"── Similarity matrix: {sim_matrix.shape}, "
+              f"range=[{sim_matrix.min():.4f}, {sim_matrix.max():.4f}] ──\n")
+    else:
+        # Large dataset path — defer full matrix; heatmap/vis steps are skipped
+        logger.warning(
+            "N=%d > %d: skipping full N×N matrix. "
+            "Retrieval will use top_k_no_precompute; heatmap skipped.",
+            _LARGE_N, LARGE_N_MATRIX_THRESHOLD,
+        )
+        sim_matrix = None
+
+    if sim_matrix is not None:
+        stats = compute_inter_video_stats(sim_matrix, index)
+        print("── Similarity stats ──")
+        for k, v in stats.items():
+            print(f"  {k}: {v:.4f}")
+        print()
+        manifest.record("similarity", **stats, n_frames=len(index))
+    else:
+        stats = {}
+        logger.info("Similarity stats skipped (large-N path).")
 
     # -----------------------------------------------------------------------
     # Step 5 – Top-k retrieval for query frames
@@ -304,9 +379,16 @@ def main() -> None:
     step = max(1, n // args.n_queries)
     query_indices = [min(i * step, n - 1) for i in range(args.n_queries)]
 
-    query_results = batch_top_k_queries(
-        query_indices, sim_matrix, index, top_k=args.top_k
-    )
+    if sim_matrix is not None:
+        # Fast path: index into precomputed matrix row
+        query_results = batch_top_k_queries(
+            query_indices, sim_matrix, index, top_k=args.top_k
+        )
+    else:
+        # Memory-efficient path: O(N·D) per query, no N×N matrix
+        query_results = top_k_no_precompute(
+            query_indices, embeddings, index, top_k=args.top_k
+        )
 
     for qidx, results in query_results.items():
         meta = index[qidx]
@@ -324,17 +406,19 @@ def main() -> None:
     logger.info("=== Step 6: Generate visualisations ===")
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
-    heatmap_path = plot_similarity_heatmap(
-        sim_matrix, index,
-        output_path=os.path.join(OUTPUTS_DIR, "similarity_heatmap.png"),
-    )
-    print(f"  Heatmap:  {heatmap_path}")
+    if sim_matrix is not None:
+        heatmap_path = plot_similarity_heatmap(
+            sim_matrix, index,
+            output_path=os.path.join(OUTPUTS_DIR, "similarity_heatmap.png"),
+        )
+        print(f"  Heatmap:  {heatmap_path}")
 
-    bar_path = plot_cross_video_similarity_bar(
-        stats,
-        output_path=os.path.join(OUTPUTS_DIR, "cross_video_similarity_bar.png"),
-    )
-    print(f"  Bar chart: {bar_path}")
+    if stats:
+        bar_path = plot_cross_video_similarity_bar(
+            stats,
+            output_path=os.path.join(OUTPUTS_DIR, "cross_video_similarity_bar.png"),
+        )
+        print(f"  Bar chart: {bar_path}")
 
     for qidx, results in query_results.items():
         grid_path = plot_top_k_grid(
@@ -347,11 +431,12 @@ def main() -> None:
     # Step 7 – Markdown report
     # -----------------------------------------------------------------------
     logger.info("=== Step 7: Write similarity report ===")
-    report_path = generate_similarity_report(
-        sim_matrix, index, query_results, stats,
-        output_path=os.path.join(OUTPUTS_DIR, "similarity_report.md"),
-    )
-    print(f"\n  Report: {report_path}")
+    if sim_matrix is not None:
+        report_path = generate_similarity_report(
+            sim_matrix, index, query_results, stats,
+            output_path=os.path.join(OUTPUTS_DIR, "similarity_report.md"),
+        )
+        print(f"\n  Report: {report_path}")
 
     # -----------------------------------------------------------------------
     # Step 8 – Affective scoring (text-guided zero-shot CLIP probing)
@@ -538,8 +623,7 @@ def main() -> None:
             features, ctr_labels = generate_synthetic_performance_data(
                 embeddings, frame_scores, index, target="ctr"
             )
-            n_pca = features.shape[1] - len(frame_scores)
-            feat_names = build_feature_names(frame_scores, n_pca)
+            feat_names = build_feature_names(frame_scores)
 
             predictor = VibePerformancePredictor(model_type="ridge")
             cv_results = predictor.cross_validate(features, ctr_labels, n_splits=5)
