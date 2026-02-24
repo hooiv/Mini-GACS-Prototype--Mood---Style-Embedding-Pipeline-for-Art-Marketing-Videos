@@ -1,0 +1,25 @@
+## Core ML / model dependencies
+torch>=2.2
+torchvision>=0.17
+transformers>=4.40
+
+## Computer-vision / image processing
+opencv-python-headless>=4.9
+Pillow>=10.3
+
+## Numerical / data
+numpy>=1.26
+scikit-learn>=1.4
+
+## Visualisation
+matplotlib>=3.8
+
+## Data handling
+pandas>=2.2
+
+## Utilities
+tqdm>=4.66
+requests>=2.31
+
+## Testing
+pytest>=7.0
