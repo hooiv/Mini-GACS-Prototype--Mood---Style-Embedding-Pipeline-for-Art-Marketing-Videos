@@ -22,7 +22,9 @@ Steps
 11. Vibe–performance regression (synthetic CTR prediction).
 11b. Calibrate predictor — compute ECE and reliability diagram.
 11c. Rank creatives — diversity-constrained MMR ranking with 95% CI.
-12. Write structured run manifest (run_manifest.json).
+12b. Text-guided creative retrieval — rank frames and videos by brand brief.
+13. Embedding distribution drift detection — MMD + KS test + anomaly fraction.
+14. Write structured run manifest (run_manifest.json).
 
 Usage
 -----
@@ -90,6 +92,8 @@ from src.quality_filter import FrameQualityFilter
 from src.experiment_manifest import PipelineManifest
 from src.ranking import CreativeRanker
 from src.calibration import PredictorCalibrator
+from src.text_query import TextQueryRetriever
+from src.drift_detector import EmbeddingDriftDetector
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -212,6 +216,13 @@ def main() -> None:
             "n_clusters_arg": args.n_clusters,
         }
     )
+
+    # These are set during the embedding step when we load the CLIP model
+    # directly (i.e. when --skip-embedding is not used).  They are passed to
+    # TextQueryRetriever so it can reuse the already-loaded model.  When
+    # --skip-embedding is used both remain None and the retriever lazy-loads.
+    clip_model = None
+    clip_processor = None
 
     # -----------------------------------------------------------------------
     # Step 1 – Download sample videos
@@ -862,7 +873,146 @@ def main() -> None:
         logger.warning("Performance regression step failed (%s); continuing.", exc)
 
     # -----------------------------------------------------------------------
-    # Step 12 – Save run manifest
+    # Step 12b – Text-guided creative retrieval
+    # -----------------------------------------------------------------------
+    logger.info("Step 12b – Text-guided creative retrieval.")
+    print("\n── Step 12b: Text-Guided Creative Retrieval ──")
+    try:
+        # clip_model and clip_processor are set at the top of main() and
+        # populated during the embedding step when the CLIP model is loaded.
+        # When --skip-embedding is used both remain None and the retriever
+        # lazy-loads its own model instance.
+        retriever = TextQueryRetriever(
+            model=clip_model,
+            processor=clip_processor,
+        )
+
+        # Representative sample briefs for demonstration
+        _DEMO_BRIEFS = {
+            "luxury_warmth": "warm, golden, opulent luxury aesthetic — premium feel",
+            "energy_action": "high energy, dynamic, fast-paced, exciting movement",
+            "calm_minimal":  "serene, minimalist, clean, contemplative — low key",
+        }
+
+        for brief_name, brief_text in _DEMO_BRIEFS.items():
+            results = retriever.query(brief_text, embeddings, index, top_k=5)
+            chart_path = retriever.plot_query_results(
+                results,
+                output_path=os.path.join(OUTPUTS_DIR, f"text_query_{brief_name}.png"),
+                title=f"Brief: {brief_name}",
+            )
+            retriever.save_results(
+                results,
+                output_path=os.path.join(OUTPUTS_DIR, f"text_query_{brief_name}.json"),
+            )
+            print(f"  [{brief_name}] top match: {results[0].video_id} "
+                  f"@ {results[0].timestamp:.1f}s  sim={results[0].similarity:.4f}")
+            manifest.add_artifact(chart_path, f"Text query chart: {brief_name}")
+
+        # Multi-brief comparison heatmap
+        comparison = retriever.multi_brief_comparison(
+            _DEMO_BRIEFS, embeddings, index
+        )
+        heatmap_path = retriever.plot_brief_comparison_heatmap(
+            comparison,
+            output_path=os.path.join(OUTPUTS_DIR, "brief_alignment_heatmap.png"),
+            title="Brand Brief × Video Alignment",
+        )
+        print(f"  Brief alignment heatmap: {heatmap_path}")
+        manifest.add_artifact(heatmap_path, "Brand brief × video alignment heatmap")
+
+        # Video ranking by primary brief
+        primary_brief = _DEMO_BRIEFS["luxury_warmth"]
+        video_ranking = retriever.rank_videos_by_brief(primary_brief, embeddings, index)
+        print(f"  Video ranking by '{primary_brief[:40]}…':")
+        for row in video_ranking:
+            print(f"    {row['video_id']:15s}  score={row['score']:.4f}  "
+                  f"({row['n_frames']} frames)")
+
+        manifest.record(
+            "text_query",
+            n_briefs=len(_DEMO_BRIEFS),
+            primary_brief=primary_brief[:60],
+            top_video=video_ranking[0]["video_id"] if video_ranking else None,
+        )
+
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.warning("Text-guided retrieval step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 13 – Embedding distribution drift detection
+    # -----------------------------------------------------------------------
+    logger.info("Step 13 – Embedding distribution drift detection.")
+    print("\n── Step 13: Embedding Distribution Drift Detection ──")
+    try:
+        # Demo: compare embeddings from the first video (reference) to
+        # embeddings from all other videos (new batch).  In production,
+        # the reference would be the batch used to train the predictor.
+        video_ids_arr = np.array([e.get("video_id", "") for e in index])
+        unique_vids = list(dict.fromkeys(video_ids_arr))  # ordered unique
+
+        if len(unique_vids) >= 2:
+            ref_mask = video_ids_arr == unique_vids[0]
+            new_mask = ~ref_mask
+            ref_embs = embeddings[ref_mask]
+            new_embs = embeddings[new_mask]
+
+            if ref_embs.shape[0] >= 5 and new_embs.shape[0] >= 5:
+                detector = EmbeddingDriftDetector(n_components=min(10, ref_embs.shape[0] - 1))
+                detector.fit(ref_embs)
+                drift_report = detector.detect(new_embs)
+
+                print(f"  Reference video:  {unique_vids[0]}  ({ref_embs.shape[0]} frames)")
+                print(f"  New-batch videos: {unique_vids[1:]}  ({new_embs.shape[0]} frames)")
+                print(f"  MMD:              {drift_report.mmd:.4f}")
+                print(f"  KS p-val (min):   {drift_report.ks_pvalue_min:.4f}")
+                print(f"  Distribution drifted: {drift_report.is_drifted}")
+                print(f"  Anomaly fraction:     {drift_report.anomaly_fraction:.3f}")
+
+                if drift_report.is_drifted:
+                    logger.warning(
+                        "Drift detected (KS min p=%.4f < %.2f): "
+                        "new batch may be out-of-distribution for the predictor.",
+                        drift_report.ks_pvalue_min, detector.alpha,
+                    )
+
+                pca_plot = detector.plot_pca_comparison(
+                    new_embs,
+                    output_path=os.path.join(OUTPUTS_DIR, "drift_pca.png"),
+                )
+                print(f"  PCA comparison:   {pca_plot}")
+                manifest.add_artifact(pca_plot, "Embedding drift PCA scatter (ref vs new)")
+
+                drift_json = detector.save_report(
+                    drift_report,
+                    output_path=os.path.join(OUTPUTS_DIR, "drift_report.json"),
+                )
+                print(f"  Drift report:     {drift_json}")
+                manifest.add_artifact(drift_json, "Embedding drift report JSON")
+
+                manifest.record(
+                    "drift_detection",
+                    mmd=round(drift_report.mmd, 4),
+                    ks_pvalue_min=round(drift_report.ks_pvalue_min, 4),
+                    is_drifted=drift_report.is_drifted,
+                    anomaly_fraction=round(drift_report.anomaly_fraction, 3),
+                    n_reference=drift_report.n_reference,
+                    n_new=drift_report.n_new,
+                )
+            else:
+                logger.info(
+                    "Too few frames in reference (%d) or new batch (%d) for drift analysis.",
+                    ref_embs.shape[0], new_embs.shape[0],
+                )
+                print("  Skipped: not enough frames per group for drift analysis.")
+        else:
+            print("  Skipped: only one video present; drift requires at least 2.")
+
+    except (RuntimeError, ValueError, OSError) as exc:
+        logger.warning("Drift detection step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 14 – Save run manifest
     # -----------------------------------------------------------------------
     manifest_path = os.path.join(OUTPUTS_DIR, "run_manifest.json")
     manifest.save(manifest_path)

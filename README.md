@@ -21,7 +21,7 @@ A self-contained Python pipeline that:
 .
 ├── src/
 │   ├── frame_extractor.py    # Video loading, frame extraction, metadata I/O
-│   ├── embeddings.py         # CLIP embedding computation and persistence
+│   ├── embeddings.py         # CLIP embedding computation and persistence (+ encode_text)
 │   ├── similarity.py         # Cosine-similarity matrix, top-k retrieval, memory-efficient retrieval
 │   ├── visualization.py      # Matplotlib heatmap, grids, bar chart, report
 │   ├── affective_scoring.py  # Zero-shot text-guided affective axis scoring (multi-prompt ensemble)
@@ -30,9 +30,13 @@ A self-contained Python pipeline that:
 │   ├── performance_predictor.py  # Vibe → CTR/ROAS ridge/MLP regression (CV leakage-free)
 │   ├── frame_deduplication.py    # Greedy cosine-threshold dedup + MMR diverse selection
 │   ├── quality_filter.py         # Technical frame quality scoring: blur, exposure, luminance
-│   └── experiment_manifest.py    # Structured run manifest for reproducibility
+│   ├── experiment_manifest.py    # Structured run manifest for reproducibility
+│   ├── ranking.py                # Diversity-constrained MMR creative ranking with bootstrap CI
+│   ├── calibration.py            # Post-hoc Platt/isotonic predictor calibration + ECE
+│   ├── text_query.py             # Text-guided creative retrieval (CLIP text-to-image search)
+│   └── drift_detector.py         # Embedding distribution drift monitoring (MMD + KS + IF)
 ├── tests/
-│   └── test_pipeline.py     # Unit + integration tests (pytest, 135 tests)
+│   └── test_pipeline.py     # Unit + integration tests (pytest, 184 tests)
 ├── data/
 │   ├── videos/              # Source videos (downloaded or user-provided)
 │   ├── frames/              # Extracted frame images (auto-generated)
@@ -43,7 +47,7 @@ A self-contained Python pipeline that:
 ├── pytest.ini               # Pytest discovery configuration
 ├── notebook.ipynb           # Interactive Jupyter walkthrough (all steps)
 ├── download_videos.py       # Helper: download 3 sample CC0 videos
-├── main.py                  # End-to-end pipeline orchestrator (12 steps)
+├── main.py                  # End-to-end pipeline orchestrator (14 steps)
 ├── requirements.txt
 ├── README.md                # This file
 └── REPORT.md                # GenTA / GACS design discussion
@@ -136,7 +140,7 @@ at each stage.
 python -m pytest tests/ -v
 ```
 
-The test suite (95 tests) uses synthetic videos and a mocked CLIP model so
+The test suite (184 tests) uses synthetic videos and a mocked CLIP model so
 **no GPU and no internet connection are needed**.  All tests pass in under
 60 seconds.
 

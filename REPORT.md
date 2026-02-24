@@ -611,3 +611,122 @@ Production use must collect OOF predictions from `cross_validate()`.
 *Verified by*: `TestPredictorCalibrator` — 8 tests including output range,
 ECE near-zero for a near-calibrated signal, JSON persistence, and error
 handling.
+
+---
+
+## 9. Text-Guided Creative Retrieval *(implemented — `src/text_query.py`)*
+
+### Gap
+
+The entire pipeline until this point treated retrieval as *image-to-image*:
+"find frames that look like frame X".  The natural workflow in a creative
+intelligence system is the inverse: a brand manager types a brief and the
+system returns the best-matching frames from the library.  This is CLIP's
+primary use case — text and images are embedded in the *same* cosine-similarity
+space — but no prior module exploited it.
+
+### Design
+
+`TextQueryRetriever` encodes a free-text query with the CLIP text encoder and
+dot-products the result with all stored frame embeddings (already L2-normalised),
+yielding a per-frame **brief alignment score**:
+
+```
+score_i = cos_sim(frame_emb_i, text_emb_query)
+        = dot(frame_emb_i, encode_text(query))  # L2-normalised
+```
+
+Three query modes are provided:
+
+1. **`query(text, top_k)`** — returns the top-*k* frames ranked by brief
+   alignment, as a typed `List[TextQueryResult]`.
+
+2. **`rank_videos_by_brief(text, aggregation="mean_top3")`** — aggregates
+   frame scores to video level.  The default `"mean_top3"` (average the top-3
+   frame scores per video) is more robust than `"mean"` when a video has mostly
+   off-brief content with a few exceptional frames: `"mean"` would bury those
+   frames, while `"mean_top3"` surfaces them.  `"max"` asks "does the video
+   contain at least one perfect match?"
+
+3. **`multi_brief_comparison(briefs)`** — evaluates multiple briefs against
+   all videos in one call, producing a `briefs × videos` alignment matrix
+   visualised as a heatmap.  This gives a creative director an instant
+   at-a-glance view of which videos best match each campaign brief.
+
+### Engineering notes
+
+- **`EmbeddingModel.encode_text()`** was added to `src/embeddings.py` — a
+  minimal change (50 lines) that gives the existing model class text encoding
+  capability without breaking any existing interface.
+- **`_InlineTextEncoder`** avoids loading a second CLIP model when the
+  pipeline has already loaded one during the embedding step.  It wraps the
+  caller-provided model/processor in a tiny object that exposes only
+  `encode_text()`.
+- The retriever gracefully falls back to lazy-loading its own model when
+  `model=None` (e.g. `--skip-embedding` mode).
+
+*Verified by*: `TestTextQueryRetriever` — 13 tests covering shape, sort order,
+1-based sequential ranks, aggregation strategies, empty-input error, JSON/PNG
+persistence, and multi-brief heatmap.
+
+---
+
+## 10. Embedding Distribution Drift Monitoring *(implemented — `src/drift_detector.py`)*
+
+### Gap
+
+`VibePerformancePredictor` is trained on one batch of creative embeddings.
+In production, new batches are ingested continuously (new campaigns, seasonal
+content, different cinematographers).  If the embedding distribution of new
+creatives drifts significantly from the training distribution, the predictor's
+feature-space assumptions may no longer hold — leading to silently degraded
+predictions without any error signal.  No prior module detected this.
+
+### Design
+
+`EmbeddingDriftDetector` compares a reference embedding set (e.g. training
+batch) to a new set using three complementary statistics:
+
+**1. Maximum Mean Discrepancy (MMD, RBF kernel)**
+
+A kernel two-sample test statistic:
+
+```
+MMD²(X, Y) = E[k(x,x')] − 2·E[k(x,y)] + E[k(y,y')]
+where k(a,b) = exp(−γ||a−b||²)
+```
+
+γ is set by the **median heuristic** (γ = 1/(2·median(sq_dist))) — the standard
+adaptive bandwidth choice for MMD.  The unbiased estimator is used.  All
+computations are performed in the reduced **PCA space** (10 components by
+default, capturing 70–90 % of variance) rather than the original 512-D CLIP
+space for two reasons: (a) speed — MMD is O(N²·D) so 10-D vs 512-D gives a
+51× speedup; (b) stability — in very high-dimensional space distances
+concentrate (concentration of measure), making kernel bandwidths ill-defined.
+
+**2. Per-component Kolmogorov-Smirnov test**
+
+For each of the *k* PCA components, `scipy.stats.ks_2samp` tests the
+null hypothesis that both sets were drawn from the same distribution.  The
+minimum p-value across components (`ks_pvalue_min`) is the most sensitive
+early-warning signal.  `is_drifted = (ks_pvalue_min < alpha)` with default
+α = 0.05.
+
+**3. Isolation Forest anomaly fraction**
+
+An Isolation Forest is fitted on the reference PCA projections.  The fraction
+of new frames scored as outliers (`anomaly_fraction`) measures how much
+out-of-distribution content is present — complements the global KS test with
+a frame-level signal.
+
+### Interpretive thresholds (guidelines, not hard rules)
+
+| Signal | No drift | Watch | Retrain |
+|--------|----------|-------|---------|
+| MMD    | < 0.05   | 0.05–0.20 | > 0.20 |
+| KS min p-val | > 0.10 | 0.05–0.10 | < 0.05 |
+| Anomaly fraction | < 0.10 | 0.10–0.25 | > 0.25 |
+
+*Verified by*: `TestEmbeddingDriftDetector` — 9 tests including same-data
+low-MMD, shifted-distribution higher-MMD, report field types, anomaly-fraction
+range, JSON/PNG persistence, and pre-fit error guard.

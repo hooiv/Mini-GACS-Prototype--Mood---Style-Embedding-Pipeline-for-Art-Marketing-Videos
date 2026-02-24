@@ -2796,6 +2796,398 @@ class TestSceneAdaptiveSampling(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# 19. TextQueryRetriever tests
+# ---------------------------------------------------------------------------
+
+class TestTextQueryRetriever(unittest.TestCase):
+    """Tests for src/text_query.py — text-guided creative retrieval."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dim = 16
+        self.n = 12
+        rng = np.random.default_rng(77)
+        raw = rng.standard_normal((self.n, self.dim)).astype(np.float32)
+        self.embeddings = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        self.index = [
+            {
+                "video_id": f"v{i % 3}",
+                "frame_idx": i,
+                "timestamp": float(i),
+                "file_path": os.path.join(self.tmp, f"frame_{i}.jpg"),
+            }
+            for i in range(self.n)
+        ]
+
+    def _make_retriever(self):
+        """Build a TextQueryRetriever with a mocked CLIP model."""
+        import torch
+        from unittest.mock import MagicMock
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+
+        def _get_text_features(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            rng = np.random.default_rng(0)
+            f = torch.tensor(
+                rng.standard_normal((n, self.dim)).astype(np.float32)
+            )
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text_features
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {
+                "input_ids": torch.zeros(n, 77, dtype=torch.long),
+                "attention_mask": torch.ones(n, 77, dtype=torch.long),
+            }
+
+        mock_proc.side_effect = _proc
+
+        from src.text_query import TextQueryRetriever
+        return TextQueryRetriever(model=mock_model, processor=mock_proc)
+
+    def test_query_returns_top_k(self):
+        """query() should return exactly top_k results."""
+        retriever = self._make_retriever()
+        results = retriever.query("warm golden luxury", self.embeddings, self.index, top_k=5)
+        self.assertEqual(len(results), 5)
+
+    def test_query_result_fields(self):
+        """Each TextQueryResult must have the expected fields."""
+        from src.text_query import TextQueryResult
+        retriever = self._make_retriever()
+        results = retriever.query("cinematic", self.embeddings, self.index, top_k=3)
+        for r in results:
+            self.assertIsInstance(r, TextQueryResult)
+            self.assertIsInstance(r.rank, int)
+            self.assertIsInstance(r.similarity, float)
+            self.assertIn("video_id", r.metadata)
+
+    def test_query_similarity_in_range(self):
+        """All similarities must be in [-1, 1]."""
+        retriever = self._make_retriever()
+        results = retriever.query("minimalist", self.embeddings, self.index, top_k=self.n)
+        for r in results:
+            self.assertGreaterEqual(r.similarity, -1.0 - 1e-5)
+            self.assertLessEqual(r.similarity, 1.0 + 1e-5)
+
+    def test_query_sorted_descending(self):
+        """Results must be sorted from highest to lowest similarity."""
+        retriever = self._make_retriever()
+        results = retriever.query("joyful uplifting", self.embeddings, self.index, top_k=8)
+        sims = [r.similarity for r in results]
+        self.assertEqual(sims, sorted(sims, reverse=True))
+
+    def test_query_rank_is_one_based_sequential(self):
+        """Ranks must be 1-based and sequential."""
+        retriever = self._make_retriever()
+        results = retriever.query("tense dramatic", self.embeddings, self.index, top_k=4)
+        ranks = [r.rank for r in results]
+        self.assertEqual(ranks, list(range(1, len(ranks) + 1)))
+
+    def test_query_empty_embeddings_raises(self):
+        """query() on empty embeddings must raise ValueError."""
+        retriever = self._make_retriever()
+        with self.assertRaises(ValueError):
+            retriever.query("test", np.empty((0, self.dim), dtype=np.float32), [], top_k=5)
+
+    def test_rank_videos_by_brief_all_videos_present(self):
+        """rank_videos_by_brief() must return an entry for every distinct video_id."""
+        retriever = self._make_retriever()
+        ranking = retriever.rank_videos_by_brief("luxury minimal", self.embeddings, self.index)
+        returned_ids = {row["video_id"] for row in ranking}
+        expected_ids = {f"v{i % 3}" for i in range(self.n)}
+        self.assertEqual(returned_ids, expected_ids)
+
+    def test_rank_videos_sorted_descending(self):
+        """rank_videos_by_brief() results must be sorted by descending score."""
+        retriever = self._make_retriever()
+        ranking = retriever.rank_videos_by_brief("energetic", self.embeddings, self.index)
+        scores = [row["score"] for row in ranking]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_multi_brief_comparison_keys(self):
+        """multi_brief_comparison() must include all brief names and video IDs."""
+        retriever = self._make_retriever()
+        briefs = {"brief_a": "warm golden", "brief_b": "dark minimal"}
+        comparison = retriever.multi_brief_comparison(briefs, self.embeddings, self.index)
+        self.assertEqual(set(comparison.keys()), {"brief_a", "brief_b"})
+        all_vids = {f"v{i % 3}" for i in range(self.n)}
+        for brief_name, vid_scores in comparison.items():
+            self.assertEqual(set(vid_scores.keys()), all_vids)
+
+    def test_save_results_creates_json(self):
+        """save_results() must write a readable JSON file."""
+        retriever = self._make_retriever()
+        results = retriever.query("cosy warm", self.embeddings, self.index, top_k=4)
+        out_path = os.path.join(self.tmp, "query_results.json")
+        retriever.save_results(results, out_path)
+        self.assertTrue(os.path.exists(out_path))
+        with open(out_path) as fh:
+            data = json.load(fh)
+        self.assertEqual(len(data), 4)
+        self.assertIn("similarity", data[0])
+
+    def test_plot_query_results_creates_png(self):
+        """plot_query_results() must write a non-empty PNG."""
+        retriever = self._make_retriever()
+        results = retriever.query("vivid colourful", self.embeddings, self.index, top_k=5)
+        out_path = os.path.join(self.tmp, "query_chart.png")
+        retriever.plot_query_results(results, out_path)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertGreater(os.path.getsize(out_path), 0)
+
+    def test_plot_brief_comparison_heatmap_creates_png(self):
+        """plot_brief_comparison_heatmap() must write a non-empty PNG."""
+        retriever = self._make_retriever()
+        briefs = {"warm": "warm golden sunset", "cool": "cold icy minimal"}
+        comparison = retriever.multi_brief_comparison(briefs, self.embeddings, self.index)
+        out_path = os.path.join(self.tmp, "brief_heatmap.png")
+        retriever.plot_brief_comparison_heatmap(comparison, out_path)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertGreater(os.path.getsize(out_path), 0)
+
+    def test_invalid_aggregation_raises(self):
+        """rank_videos_by_brief() with unknown aggregation must raise ValueError."""
+        retriever = self._make_retriever()
+        with self.assertRaises(ValueError):
+            retriever.rank_videos_by_brief(
+                "test", self.embeddings, self.index, aggregation="unknown"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 20. EmbeddingDriftDetector tests
+# ---------------------------------------------------------------------------
+
+class TestEmbeddingDriftDetector(unittest.TestCase):
+    """Tests for src/drift_detector.py — distribution drift monitoring."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dim = 32
+        rng = np.random.default_rng(55)
+        raw = rng.standard_normal((60, self.dim)).astype(np.float32)
+        self.reference = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def test_fit_then_detect_no_error(self):
+        """fit() followed by detect() must not raise on same-shape input."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        rng = np.random.default_rng(56)
+        raw = rng.standard_normal((20, self.dim)).astype(np.float32)
+        new_embs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        report = det.detect(new_embs)
+        self.assertIsNotNone(report)
+
+    def test_detect_before_fit_raises(self):
+        """detect() before fit() must raise RuntimeError."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector()
+        rng = np.random.default_rng(1)
+        raw = rng.standard_normal((10, self.dim)).astype(np.float32)
+        new_embs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        with self.assertRaises(RuntimeError):
+            det.detect(new_embs)
+
+    def test_mmd_is_nonnegative(self):
+        """MMD must always be ≥ 0."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        rng = np.random.default_rng(57)
+        raw = rng.standard_normal((30, self.dim)).astype(np.float32)
+        new_embs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        report = det.detect(new_embs)
+        self.assertGreaterEqual(report.mmd, 0.0)
+
+    def test_same_data_low_mmd(self):
+        """Comparing reference to itself should yield near-zero MMD."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        report = det.detect(self.reference)
+        # MMD for identical data should be very small (numerical noise only)
+        self.assertLess(report.mmd, 0.05)
+
+    def test_shifted_distribution_higher_mmd(self):
+        """A large constant shift must produce higher MMD than the reference."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        report_same = det.detect(self.reference)
+        # Add a large shift — should be clearly more drifted
+        shifted = self.reference + 3.0
+        shifted = shifted / np.linalg.norm(shifted, axis=1, keepdims=True)
+        report_shifted = det.detect(shifted)
+        self.assertGreater(report_shifted.mmd, report_same.mmd)
+
+    def test_drift_report_fields(self):
+        """DriftReport must contain all required fields with correct types."""
+        from src.drift_detector import EmbeddingDriftDetector, DriftReport
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        rng = np.random.default_rng(58)
+        raw = rng.standard_normal((15, self.dim)).astype(np.float32)
+        new_embs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        report = det.detect(new_embs)
+        self.assertIsInstance(report, DriftReport)
+        self.assertIsInstance(report.mmd, float)
+        self.assertIsInstance(report.ks_pvalue_min, float)
+        self.assertIsInstance(report.is_drifted, bool)
+        self.assertIsInstance(report.anomaly_fraction, float)
+        self.assertIsInstance(report.component_pvalues, list)
+        self.assertEqual(len(report.component_pvalues), report.n_pca_components)
+
+    def test_anomaly_fraction_in_range(self):
+        """Anomaly fraction must be in [0, 1]."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        rng = np.random.default_rng(59)
+        raw = rng.standard_normal((20, self.dim)).astype(np.float32)
+        new_embs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        report = det.detect(new_embs)
+        self.assertGreaterEqual(report.anomaly_fraction, 0.0)
+        self.assertLessEqual(report.anomaly_fraction, 1.0)
+
+    def test_save_report_creates_json(self):
+        """save_report() must write a readable JSON file."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        rng = np.random.default_rng(60)
+        raw = rng.standard_normal((20, self.dim)).astype(np.float32)
+        new_embs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        report = det.detect(new_embs)
+        out_path = os.path.join(self.tmp, "drift_report.json")
+        det.save_report(report, out_path)
+        self.assertTrue(os.path.exists(out_path))
+        with open(out_path) as fh:
+            data = json.load(fh)
+        self.assertIn("mmd", data)
+        self.assertIn("is_drifted", data)
+
+    def test_plot_pca_comparison_creates_png(self):
+        """plot_pca_comparison() must write a non-empty PNG."""
+        from src.drift_detector import EmbeddingDriftDetector
+        det = EmbeddingDriftDetector(n_components=5)
+        det.fit(self.reference)
+        rng = np.random.default_rng(61)
+        raw = rng.standard_normal((20, self.dim)).astype(np.float32)
+        new_embs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+        out_path = os.path.join(self.tmp, "drift_pca.png")
+        det.plot_pca_comparison(new_embs, out_path)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertGreater(os.path.getsize(out_path), 0)
+
+
+# ---------------------------------------------------------------------------
+# 21. EmbeddingModel.encode_text tests
+# ---------------------------------------------------------------------------
+
+class TestEncodeText(unittest.TestCase):
+    """Tests for the new EmbeddingModel.encode_text() method."""
+
+    @patch("src.embeddings.CLIPModel")
+    @patch("src.embeddings.CLIPProcessor")
+    def test_encode_text_shape(self, MockProc, MockModel):
+        """encode_text returns (N, D) for N input texts."""
+        import torch
+        from src.embeddings import EmbeddingModel
+
+        dim = 16
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+
+        def _text_features(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _text_features
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "attention_mask": torch.ones(n, 77, dtype=torch.long)}
+
+        mock_proc.side_effect = _proc
+        MockProc.from_pretrained.return_value = mock_proc
+
+        model = EmbeddingModel(model_name="mock/clip")
+        texts = ["warm golden", "cold minimal", "high energy"]
+        result = model.encode_text(texts)
+        self.assertEqual(result.shape, (3, dim))
+        self.assertEqual(result.dtype, np.float32)
+
+    @patch("src.embeddings.CLIPModel")
+    @patch("src.embeddings.CLIPProcessor")
+    def test_encode_text_empty_raises(self, MockProc, MockModel):
+        """encode_text([]) must raise ValueError."""
+        from src.embeddings import EmbeddingModel
+        MockModel.from_pretrained.return_value = MagicMock(
+            eval=MagicMock(return_value=MagicMock(to=MagicMock(return_value=MagicMock())))
+        )
+        MockProc.from_pretrained.return_value = MagicMock()
+        model = EmbeddingModel(model_name="mock/clip")
+        with self.assertRaises(ValueError):
+            model.encode_text([])
+
+    @patch("src.embeddings.CLIPModel")
+    @patch("src.embeddings.CLIPProcessor")
+    def test_encode_text_l2_normalised(self, MockProc, MockModel):
+        """Output vectors must be L2-normalised (norm ≈ 1.0)."""
+        import torch
+        from src.embeddings import EmbeddingModel
+
+        dim = 16
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+
+        def _text_features(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _text_features
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "attention_mask": torch.ones(n, 77, dtype=torch.long)}
+
+        mock_proc.side_effect = _proc
+        MockProc.from_pretrained.return_value = mock_proc
+
+        model = EmbeddingModel(model_name="mock/clip")
+        result = model.encode_text(["cozy warm light", "cold icy dark"])
+        norms = np.linalg.norm(result, axis=1)
+        np.testing.assert_allclose(norms, np.ones(len(norms)), atol=1e-5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

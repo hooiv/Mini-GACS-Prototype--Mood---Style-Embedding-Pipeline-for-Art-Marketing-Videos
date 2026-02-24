@@ -116,6 +116,52 @@ class EmbeddingModel:
         """
         return self.embed_images([image_path])[0]
 
+    def encode_text(self, texts: List[str]) -> np.ndarray:
+        """
+        Encode a list of text strings to L2-normalised CLIP text embeddings.
+
+        CLIP places text and image embeddings in the same cosine-similarity
+        space, so the output can be directly dot-producted with image embeddings
+        (produced by :meth:`embed_images`) to measure text-to-image alignment.
+
+        Args:
+            texts:  List of strings (prompts, captions, brand briefs, …).
+
+        Returns:
+            Float32 array ``(N, D)`` of L2-normalised text embeddings, where
+            *N* = ``len(texts)`` and *D* is the CLIP embedding dimension.
+
+        Raises:
+            ValueError: if *texts* is empty or any embedding is NaN.
+        """
+        if not texts:
+            raise ValueError("texts must be a non-empty list.")
+
+        inputs = self.processor(
+            text=texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            text_features = self.model.get_text_features(**inputs)
+
+        # L2 normalise so dot product == cosine similarity with image embeddings
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        result = text_features.cpu().numpy().astype(np.float32)
+
+        if np.isnan(result).any():
+            raise ValueError("Text embeddings contain NaN values.")
+
+        logger.debug(
+            "Encoded %d text string(s): shape=%s, range=[%.4f, %.4f].",
+            len(texts), result.shape,
+            float(result.min()), float(result.max()),
+        )
+        return result
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
