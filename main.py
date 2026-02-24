@@ -8,6 +8,7 @@ Steps
 -----
 1.  (Optional) Download sample videos.
 2.  Extract frames from all videos found in ``data/videos/``.
+    2b. Scene-adaptive extraction mode (``--scene-adaptive``).
 3.  Compute CLIP embeddings for all frames.
 3b. Content-adaptive deduplication — remove near-duplicate frames.
 3c. Technical quality filtering — remove blurry/over-exposed/uniform frames.
@@ -19,6 +20,8 @@ Steps
 9.  Vibe clustering with silhouette-based quality metrics.
 10. Temporal analysis with consecutive-frame transition detection.
 11. Vibe–performance regression (synthetic CTR prediction).
+11b. Calibrate predictor — compute ECE and reliability diagram.
+11c. Rank creatives — diversity-constrained MMR ranking with 95% CI.
 12. Write structured run manifest (run_manifest.json).
 
 Usage
@@ -28,6 +31,9 @@ Usage
 
     # Skip download step if you already have videos:
     python main.py --skip-download
+
+    # Use scene-adaptive frame extraction:
+    python main.py --scene-adaptive
 
     # Override interval / model:
     python main.py --interval 2 --model openai/clip-vit-base-patch32
@@ -52,7 +58,12 @@ logger = logging.getLogger("main")
 # ---------------------------------------------------------------------------
 # Local imports
 # ---------------------------------------------------------------------------
-from src.frame_extractor import process_video_directory, load_metadata
+from src.frame_extractor import (
+    process_video_directory,
+    load_metadata,
+    extract_frames_scene_adaptive,
+    save_metadata,
+)
 from src.embeddings import compute_and_save_embeddings, load_embeddings
 from src.similarity import (
     cosine_similarity_matrix,
@@ -77,6 +88,8 @@ from src.performance_predictor import (
 from src.frame_deduplication import deduplicate_frames
 from src.quality_filter import FrameQualityFilter
 from src.experiment_manifest import PipelineManifest
+from src.ranking import CreativeRanker
+from src.calibration import PredictorCalibrator
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -151,6 +164,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of vibe clusters (default: 0 = auto-detect via silhouette).",
     )
     p.add_argument(
+        "--scene-adaptive",
+        action="store_true",
+        help=(
+            "Use scene-adaptive frame extraction (pixel-fingerprint scene "
+            "detection) instead of uniform interval sampling.  "
+            "Yields one keyframe per detected scene; eliminates slow-pan "
+            "frame redundancy without requiring CLIP inference."
+        ),
+    )
+    p.add_argument(
         "--dedup-threshold",
         type=float,
         default=0.97,
@@ -183,6 +206,7 @@ def main() -> None:
             "model": args.model,
             "interval_seconds": args.interval,
             "max_frames": args.max_frames,
+            "scene_adaptive": args.scene_adaptive,
             "dedup_threshold": args.dedup_threshold,
             "min_quality_score": args.min_quality_score,
             "n_clusters_arg": args.n_clusters,
@@ -209,6 +233,48 @@ def main() -> None:
     if args.skip_extraction and os.path.exists(combined_csv):
         logger.info("=== Step 2: Loading existing frame metadata ===")
         metadata = load_metadata(combined_csv)
+    elif args.scene_adaptive:
+        # ---------------------------------------------------------------
+        # Step 2b – Scene-adaptive extraction
+        # One representative keyframe per detected visual scene, extracted
+        # via pixel-level fingerprinting (no CLIP dependency).
+        # ---------------------------------------------------------------
+        logger.info("=== Step 2 (scene-adaptive): Extract scene keyframes ===")
+        import glob as _glob
+        extensions = (".mp4", ".avi", ".mov", ".mkv", ".webm")
+        video_files = sorted([
+            f for f in (
+                os.path.join(VIDEOS_DIR, fn)
+                for fn in os.listdir(VIDEOS_DIR)
+                if os.path.isfile(os.path.join(VIDEOS_DIR, fn))
+            )
+            if os.path.splitext(f)[1].lower() in extensions
+        ])
+        metadata = []
+        os.makedirs(FRAMES_DIR, exist_ok=True)
+        os.makedirs(METADATA_DIR, exist_ok=True)
+        for vpath in video_files:
+            from pathlib import Path as _Path
+            vid_id = _Path(vpath).stem
+            vid_frames_dir = os.path.join(FRAMES_DIR, vid_id)
+            try:
+                meta = extract_frames_scene_adaptive(
+                    vpath,
+                    vid_frames_dir,
+                    coarse_fps=2.0,
+                    transition_threshold=0.20,
+                    max_scenes=args.max_frames,
+                )
+                csv_out = os.path.join(METADATA_DIR, f"{vid_id}_metadata.csv")
+                save_metadata(meta, csv_out)
+                metadata.extend(meta)
+                logger.info(
+                    "Scene-adaptive: %d keyframes from '%s'.", len(meta), vid_id
+                )
+            except (FileNotFoundError, RuntimeError) as exc:
+                logger.error("Skipping '%s': %s", vpath, exc)
+        if metadata:
+            save_metadata(metadata, combined_csv)
     else:
         logger.info("=== Step 2: Extract frames from videos ===")
         metadata = process_video_directory(
@@ -675,6 +741,122 @@ def main() -> None:
                 n_features=features.shape[1],
                 top_features={fname: round(score, 4) for fname, score in importance},
             )
+
+            # -------------------------------------------------------------------
+            # Step 11b – Calibrate predictor (Platt scaling + reliability diagram)
+            #
+            # The ridge predictor outputs raw regression scores in [0, 1] that
+            # are NOT calibrated probabilities.  Post-hoc Platt scaling fits a
+            # logistic sigmoid on the cross-validated OOF predictions, so the
+            # output scores have a proper frequentist interpretation:
+            # score = 0.7 means ~70% of creatives with that score land above
+            # median CTR.  ECE < 0.05 is the production-grade target.
+            # -------------------------------------------------------------------
+            logger.info("=== Step 11b: Calibrate predictor ===")
+            try:
+                calibrator = PredictorCalibrator(method="platt")
+                # Use the point estimates on training data as a proxy for
+                # OOF predictions (honest calibration requires a held-out set;
+                # this is a prototype-grade approximation for demo purposes).
+                # TODO(production): replace `predicted_ctr` with OOF predictions
+                # collected from cross_validate() to avoid in-sample over-confidence.
+                logger.warning(
+                    "Calibrator fitted on in-sample predictions — "
+                    "use out-of-fold (OOF) predictions from cross_validate() "
+                    "for honest calibration in production."
+                )
+                calibrator.fit(predicted_ctr, ctr_labels)
+                calibrated_ctr = calibrator.transform(predicted_ctr)
+                ece = calibrator.expected_calibration_error(calibrated_ctr, ctr_labels)
+
+                print(f"\n── Predictor calibration (Platt scaling) ──")
+                print(f"  ECE (uncalibrated proxy): {ece:.4f}  (< 0.05 = well-calibrated)")
+
+                cal_diagram = calibrator.plot_reliability_diagram(
+                    calibrated_ctr, ctr_labels,
+                    output_path=os.path.join(OUTPUTS_DIR, "calibration_reliability.png"),
+                    raw_scores=predicted_ctr,
+                    title="CTR Predictor Calibration — Reliability Diagram",
+                )
+                print(f"  Reliability diagram: {cal_diagram}")
+
+                cal_params = calibrator.save_calibration_params(
+                    output_path=os.path.join(OUTPUTS_DIR, "calibration_params.json"),
+                )
+                print(f"  Calibration params:  {cal_params}")
+
+                manifest.record(
+                    "calibration",
+                    method="platt",
+                    ece=round(ece, 4),
+                )
+                manifest.add_artifact(cal_diagram, "Reliability diagram — calibrated CTR")
+
+            except (RuntimeError, ValueError, OSError) as exc:
+                logger.warning("Calibration step failed (%s); continuing.", exc)
+                calibrated_ctr = predicted_ctr  # fall back to raw scores
+
+            # -------------------------------------------------------------------
+            # Step 11c – Rank creatives (MMR diversity + bootstrap CI)
+            #
+            # Pure score ranking surfaces the N most similar top-scoring frames,
+            # not the N most useful.  CreativeRanker applies MMR re-ranking:
+            # each successive selection maximises the trade-off between predicted
+            # CTR (or its CI lower bound for conservative ranking) and novelty
+            # relative to already-selected items.  The result is the top-10
+            # most confidently high-performing AND visually diverse creatives.
+            # -------------------------------------------------------------------
+            logger.info("=== Step 11c: Rank creatives (MMR + bootstrap CI) ===")
+            try:
+                ranker = CreativeRanker(
+                    predictor,
+                    lambda_mmr=0.6,
+                    n_bootstrap=200,
+                    ci_level=0.95,
+                )
+                ranked = ranker.rank(
+                    embeddings, features, index,
+                    top_k=min(10, len(index)),
+                    use_ci_lower=True,
+                )
+
+                print(f"\n── Top-{len(ranked)} creatives (MMR-ranked, 95% CI) ──")
+                for rc in ranked[:5]:
+                    print(
+                        f"  #{rc.rank:2d}  {rc.video_id} @ {rc.timestamp:.1f}s  "
+                        f"score={rc.predicted_score:.3f}  "
+                        f"CI=[{rc.ci_lower:.3f}, {rc.ci_upper:.3f}]  "
+                        f"diversity={rc.diversity_score:.3f}"
+                    )
+                if len(ranked) > 5:
+                    print(f"  ... ({len(ranked) - 5} more)")
+                print()
+
+                ranking_chart = ranker.plot_ranking(
+                    ranked,
+                    output_path=os.path.join(OUTPUTS_DIR, "creative_ranking.png"),
+                    title="Creative Ranking — Predicted CTR with 95% Bootstrap CI",
+                )
+                print(f"  Ranking chart:  {ranking_chart}")
+
+                ranking_json = ranker.save_ranking(
+                    ranked,
+                    output_path=os.path.join(OUTPUTS_DIR, "creative_ranking.json"),
+                )
+                print(f"  Ranking JSON:   {ranking_json}")
+
+                manifest.record(
+                    "creative_ranking",
+                    lambda_mmr=0.6,
+                    n_bootstrap=200,
+                    top_k=len(ranked),
+                    top_video=ranked[0].video_id if ranked else None,
+                    top_score=round(ranked[0].predicted_score, 4) if ranked else None,
+                )
+                manifest.add_artifact(ranking_chart, "MMR-ranked creative bar chart")
+
+            except (RuntimeError, ValueError, OSError) as exc:
+                logger.warning("Creative ranking step failed (%s); continuing.", exc)
 
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("Performance regression step failed (%s); continuing.", exc)

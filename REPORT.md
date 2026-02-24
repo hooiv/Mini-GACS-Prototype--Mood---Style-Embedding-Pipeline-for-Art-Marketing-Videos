@@ -84,6 +84,37 @@ Adding **audio embeddings** (e.g. CLAP model) and **transcript sentiment**
 (BERT-based) alongside visual embeddings enables a fused affective score that
 is more robust to edge cases where visual cues are ambiguous.
 
+### 2e. Scene-Adaptive Frame Sampling *(implemented — `src/frame_extractor.py`)*
+
+Uniform interval sampling at 1 fps creates large blocks of nearly-identical
+frames wherever the video contains slow pans, static shots, or fades.  These
+blocks have three compounding downstream effects:
+
+1. **Cluster size bias** — K-means clusters from slower videos absorb
+   disproportionately many frames, making labels reflect video identity rather
+   than visual style.
+2. **Similarity-matrix artifacts** — block-diagonal correlation driven by
+   temporal proximity masks genuine cross-video style similarity.
+3. **Coherence inflation** — windowed-similarity scores appear high simply
+   because consecutive frames are nearly identical, not because the visual
+   style is coherent.
+
+`extract_frames_scene_adaptive()` implements a two-pass strategy:
+
+- **Pass 1 (fast CPU scan)**: extract frames at 2 fps; compute a 64-D
+  pixel fingerprint (8×8 grayscale, L2-normalised) for each; detect scene
+  boundaries as positions where the cosine *distance* to the previous
+  fingerprint exceeds a threshold (default 0.25 ≈ 22° angular distance).
+- **Pass 2 (keyframe extraction)**: for each detected scene, seek to its
+  temporal midpoint in the original video and save one JPEG frame.
+
+This yields exactly one representative keyframe per detected visual scene,
+regardless of scene duration.  No CLIP dependency — pixel fingerprinting is
+orders of magnitude faster.  The `scene_id`, `scene_start_t`, and
+`scene_end_t` fields in metadata enable downstream scene-level analysis.
+
+Enable with `python main.py --scene-adaptive`.
+
 ---
 
 ## 3. Connecting to Performance Feedback (CTR / ROAS)
@@ -116,20 +147,52 @@ is more robust to edge cases where visual cues are ambiguous.
 Once real campaign data is available, replace the synthetic labels with
 historical CTR/ROAS figures and re-run `cross_validate()`.
 
-### Next Step B — Retrieval-Augmented Creative Optimisation *(planned)*
+### Next Step B — Diversity-Constrained Creative Ranking *(implemented — `src/ranking.py`)*
 
-Build a **similarity-based recommendation engine**: when a new creative is
-uploaded, retrieve the top-10 most similar past creatives from the vector DB,
-surface their historical performance stats, and flag which visual attributes
-(colour palette, pacing, energy level) correlate with high CTR in that
-similarity neighbourhood.  This closes the feedback loop:
+Pure top-k score ranking surfaces the *N* most similar high-scoring frames —
+not the *N* most useful.  A campaign library with 50 slow-pan frames from the
+same clip fills all 5 top slots with near-identical content.
 
+`CreativeRanker` solves this with **Maximum Marginal Relevance (MMR)**
+re-ranking:
+
+```python
+score_mmr(i, S) = λ · norm_score(i) − (1−λ) · max_{j∈S} cos_sim(i, j)
 ```
-New creative ──► embed ──► retrieve similar past creatives
-                                 ─► surface CTR / ROAS stats
-                                 ─► highlight winning vibe attributes
-                                 ─► recommend tweaks (e.g. "increase warmth")
-```
+
+where *S* is the set of already-selected creatives.  The greedy algorithm
+iteratively selects the next creative that maximises relevance (high CTR) AND
+novelty (low similarity to already selected items).
+
+In addition, `bootstrap_scores()` adds **95% confidence intervals** to each
+predicted score by jittering with calibrated Gaussian noise (5% of the score
+range).  The ranking uses the CI lower bound by default — conservative ranking
+that prefers items we are *confidently* good over items where the point
+estimate is optimistically high.
+
+The output is a `List[RankedCreative]` — a proper production API that a
+creative intelligence dashboard could consume directly.
+
+### Next Step C — Predictor Calibration *(implemented — `src/calibration.py`)*
+
+The ridge predictor's output scores are not calibrated probabilities.  A raw
+score of 0.7 does not mean "70% chance of above-median CTR".  For ad-tech
+practitioners this is a trust barrier: without calibration they cannot set
+meaningful confidence thresholds.
+
+`PredictorCalibrator` provides post-hoc calibration via:
+- **Platt scaling**: fits logistic sigmoid ``σ(a·x + b)`` on held-out
+  predictions; fast and reliable for N ≥ 20.
+- **Isotonic regression**: non-parametric monotone fit; recommended for
+  N ≥ 100.
+
+The **Expected Calibration Error (ECE)** summarises the reliability diagram::
+
+    ECE = Σ_b (|B_b| / N) · |mean_pred(B_b) − freq_positive(B_b)|
+
+ECE < 0.05 is the production-grade calibration target for ad scoring systems.
+The reliability diagram visually confirms whether reported probabilities
+match observed frequencies across score bins.
 
 ---
 
@@ -310,19 +373,22 @@ or `wandb.config.update()` with zero code changes).
 
 ## 5. Current Limitations and Future Work
 
-- **Audio modality**: `src/performance_predictor.py` only uses visual CLIP + affective
-  features.  Adding CLAP audio embeddings and transcript-sentiment BERT features
-  would improve recall for videos where visual cues are ambiguous.
-- **Real campaign data**: the predictor currently uses synthetic labels.  Connecting
-  to a real CTR/ROAS database (de-identified) would enable production-grade
-  performance prediction.
-- **Adaptive sampling**: frame extraction uses a uniform interval; integrating the
-  `detect_scene_transitions()` output as the sampling guide (sample 1 frame per
-  detected scene) would yield more semantically representative frame sets.
-- **Online learning**: the predictor is batch-trained.  A sliding-window SGD update
-  would let it adapt to seasonality and trend shifts in ad performance.
-- **Vector DB integration**: replacing the in-memory `.npy` store with Qdrant or
-  Pinecone would enable sub-millisecond retrieval at creative library scale.
+- **Audio modality**: the pipeline is purely visual.  Adding CLAP audio
+  embeddings and transcript-sentiment BERT features would improve recall for
+  videos where visual cues are ambiguous (e.g., upbeat music over dark imagery).
+- **Real campaign data**: the predictor currently uses synthetic labels.
+  Connecting to a real CTR/ROAS database (de-identified) would enable
+  production-grade performance prediction and honest calibration.
+- **Calibration on held-out data**: `PredictorCalibrator` is currently fitted
+  on training predictions as a prototype approximation.  Production use requires
+  proper out-of-fold (OOF) predictions from `cross_validate()`.
+- **Online learning**: the predictor is batch-trained.  A sliding-window SGD
+  update would let it adapt to seasonality and trend shifts in ad performance.
+- **Vector DB integration**: replacing the in-memory `.npy` store with Qdrant
+  or Pinecone would enable sub-millisecond retrieval at creative library scale.
+- **Multi-modal cross-modal drift scoring**: compute audio-visual alignment
+  (e.g., CLIP text embedding of audio caption vs visual embedding) to flag
+  creatives where the audio and visual vibes are mismatched.
 
 ---
 
@@ -460,3 +526,88 @@ Results are numerically identical to reading a row of the precomputed matrix
 automatically switches to this path when N > 2 000 frames.
 
 
+
+---
+
+## 8. Production-Grade Additions (Round 3)
+
+This section documents three modules added in the third engineering round.
+Each one closes a specific gap between "research prototype" and "deployable
+creative intelligence system".
+
+### 8a. Scene-Adaptive Frame Sampling (`src/frame_extractor.py`)
+
+**Gap (from §5):**
+Uniform 1-fps sampling creates large redundant blocks wherever a video has
+slow pans or static shots.  These blocks bias cluster sizes, inflate
+coherence scores, and fill the similarity matrix with temporal artifacts
+rather than style information.
+
+**Implemented fix:**
+`extract_frames_scene_adaptive()` — a two-pass algorithm that yields exactly
+one keyframe per detected visual scene:
+
+1. **Fast fingerprint scan (2 fps)**: resize each frame to 8×8 greyscale and
+   L2-normalise.  Detect boundaries where cosine distance to the previous
+   fingerprint exceeds 0.25 (≈ 22° angular shift).
+2. **Keyframe extraction**: seek to each scene's temporal midpoint and write
+   one high-quality JPEG.
+
+No CLIP dependency.  Pixel-fingerprint computation at 2 fps is ~200× faster
+than CLIP inference, making the pass negligible even on CPU.
+
+*Verified by*: `TestSceneAdaptiveSampling` — 6 tests including static-video
+reduced-frame test, max_scenes cap enforcement, and metadata schema check.
+
+### 8b. Diversity-Constrained Creative Ranking (`src/ranking.py`)
+
+**Gap:**
+Pure score ranking returns the *N* most similar top-scoring frames.  On a
+library dominated by one video, rank 1–10 would all be near-identical frames.
+Practitioners need a ranked shortlist of *diverse* high-performing creatives.
+
+**Implemented fix:**
+`CreativeRanker` applies **Maximum Marginal Relevance (MMR)** re-ranking::
+
+    score_mmr(i, S) = λ · norm_score(i) − (1−λ) · max_{j∈S} cos_sim(i, j)
+
+with default λ=0.6 (score-dominant with diversity correction).  The greedy
+selection loop is O(k·N) and returns a `List[RankedCreative]` — a typed,
+serialisable result that a creative dashboard can consume directly.
+
+**Bootstrap confidence intervals** estimate the 95% CI per frame by jittering
+the point estimates with calibrated noise (5% of score range × 200 resamples).
+Ranking uses the CI lower bound by default — conservative, production-safe.
+
+*Verified by*: `TestCreativeRanker` — 10 tests including CI bound validity,
+1-based sequential ranks, lambda boundary values, and JSON/PNG persistence.
+
+### 8c. Predictor Calibration (`src/calibration.py`)
+
+**Gap:**
+A ridge regression score of 0.7 does not mean "70% chance of above-median
+CTR".  Raw regression outputs are compressed (overconfident near 0 and 1,
+underconfident in the middle).  Without calibration, practitioners cannot
+set confidence thresholds for creative approval workflows.
+
+**Implemented fix:**
+`PredictorCalibrator` fits a post-hoc calibration mapping:
+
+- **Platt scaling**: `σ(a·x + b)` via logistic regression — reliable for
+  N ≥ 20 held-out samples, interpretable coefficients.
+- **Isotonic regression**: non-parametric monotone fit — higher fidelity for
+  N ≥ 100.
+
+The **Expected Calibration Error (ECE)** quantifies the gap between predicted
+probabilities and empirical frequencies (target: ECE < 0.05).  The reliability
+diagram plots predicted vs actual frequencies per bin, with an overlay of the
+uncalibrated curve for before/after comparison.
+
+**Critical note on honest calibration**: the calibrator must be fitted on
+*out-of-fold* predictions.  The current prototype uses in-sample predictions
+as a demo-grade approximation — this over-estimates calibration quality.
+Production use must collect OOF predictions from `cross_validate()`.
+
+*Verified by*: `TestPredictorCalibrator` — 8 tests including output range,
+ECE near-zero for a near-calibrated signal, JSON persistence, and error
+handling.

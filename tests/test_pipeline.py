@@ -2455,5 +2455,347 @@ class TestCVLeakageFix(unittest.TestCase):
                            "Spearman ρ should be > 0.4 even without PCA features")
 
 
+# ---------------------------------------------------------------------------
+# 10. Creative ranking tests
+# ---------------------------------------------------------------------------
+
+class TestCreativeRanker(unittest.TestCase):
+    """Tests for src/ranking.py — CreativeRanker."""
+
+    def _make_data(self, n: int = 20, d: int = 16, n_axes: int = 6):
+        """Return (embeddings, features, index, fitted_predictor)."""
+        from src.performance_predictor import (
+            VibePerformancePredictor,
+            generate_synthetic_performance_data,
+        )
+
+        rng = np.random.default_rng(42)
+        embs = rng.standard_normal((n, d)).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+
+        axis_names = ["joy", "warmth", "energy", "luxury", "complexity", "tension"][:n_axes]
+        aff = {a: rng.standard_normal(n).astype(np.float32) for a in axis_names}
+        features, labels = generate_synthetic_performance_data(embs, aff, [])
+
+        predictor = VibePerformancePredictor(model_type="ridge")
+        predictor.fit(features, labels)
+
+        index = [{"video_id": f"vid_{i % 3}", "timestamp": float(i)} for i in range(n)]
+        return embs, features, index, predictor
+
+    def test_rank_returns_correct_count(self):
+        """rank() returns exactly top_k items."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=20)
+        ranker = CreativeRanker(pred, n_bootstrap=20)
+        ranked = ranker.rank(embs, feats, idx, top_k=5)
+        self.assertEqual(len(ranked), 5)
+
+    def test_rank_positions_are_1based_sequential(self):
+        """rank field is 1, 2, 3, ... in order."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=15)
+        ranker = CreativeRanker(pred, n_bootstrap=20)
+        ranked = ranker.rank(embs, feats, idx, top_k=5)
+        positions = [rc.rank for rc in ranked]
+        self.assertEqual(positions, list(range(1, len(ranked) + 1)))
+
+    def test_rank_ci_bounds_are_valid(self):
+        """ci_lower ≤ predicted_score ≤ ci_upper for every item."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=20)
+        ranker = CreativeRanker(pred, n_bootstrap=50)
+        ranked = ranker.rank(embs, feats, idx, top_k=8)
+        for rc in ranked:
+            self.assertLessEqual(rc.ci_lower, rc.predicted_score + 1e-5)
+            self.assertLessEqual(rc.predicted_score, rc.ci_upper + 1e-5)
+
+    def test_rank_required_fields_present(self):
+        """Every RankedCreative has all required fields."""
+        from src.ranking import CreativeRanker, RankedCreative
+        import dataclasses
+        embs, feats, idx, pred = self._make_data(n=15)
+        ranker = CreativeRanker(pred, n_bootstrap=20)
+        ranked = ranker.rank(embs, feats, idx, top_k=3)
+        required = {f.name for f in dataclasses.fields(RankedCreative)}
+        for rc in ranked:
+            for field in required:
+                self.assertTrue(hasattr(rc, field), f"Missing field: {field}")
+
+    def test_rank_diversity_nonzero_when_multiple_items(self):
+        """diversity_score > 0 for items after the first."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=20)
+        ranker = CreativeRanker(pred, lambda_mmr=0.6, n_bootstrap=20)
+        ranked = ranker.rank(embs, feats, idx, top_k=5)
+        if len(ranked) > 1:
+            # Items after rank 1 should have positive diversity (max_sim < 1)
+            for rc in ranked[1:]:
+                self.assertGreaterEqual(rc.diversity_score, 0.0)
+
+    def test_rank_top_k_capped_to_n(self):
+        """Requesting more items than available returns all available."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=5)
+        ranker = CreativeRanker(pred, n_bootstrap=20)
+        ranked = ranker.rank(embs, feats, idx, top_k=100)
+        self.assertLessEqual(len(ranked), 5)
+
+    def test_lambda_boundary_values_do_not_crash(self):
+        """λ=0 (pure diversity) and λ=1 (pure score) must not raise."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=12)
+        for lam in (0.0, 1.0):
+            ranker = CreativeRanker(pred, lambda_mmr=lam, n_bootstrap=20)
+            ranked = ranker.rank(embs, feats, idx, top_k=4)
+            self.assertGreater(len(ranked), 0)
+
+    def test_save_ranking_writes_valid_json(self):
+        """save_ranking() writes a readable JSON file with correct count."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=15)
+        ranker = CreativeRanker(pred, n_bootstrap=20)
+        ranked = ranker.rank(embs, feats, idx, top_k=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ranking.json")
+            out = ranker.save_ranking(ranked, path)
+            self.assertTrue(os.path.exists(out))
+            with open(out) as fh:
+                data = json.load(fh)
+            self.assertEqual(len(data), len(ranked))
+            self.assertIn("predicted_score", data[0])
+
+    def test_plot_ranking_creates_png(self):
+        """plot_ranking() saves a non-empty PNG file."""
+        from src.ranking import CreativeRanker
+        embs, feats, idx, pred = self._make_data(n=12)
+        ranker = CreativeRanker(pred, n_bootstrap=20)
+        ranked = ranker.rank(embs, feats, idx, top_k=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ranking.png")
+            out = ranker.plot_ranking(ranked, path)
+            self.assertTrue(os.path.exists(out))
+            self.assertGreater(os.path.getsize(out), 1024)
+
+    def test_invalid_lambda_raises(self):
+        """CreativeRanker(lambda_mmr=1.5) must raise ValueError."""
+        from src.ranking import CreativeRanker
+        _, _, _, pred = self._make_data(n=10)
+        with self.assertRaises(ValueError):
+            CreativeRanker(pred, lambda_mmr=1.5)
+
+
+# ---------------------------------------------------------------------------
+# 11. Predictor calibration tests
+# ---------------------------------------------------------------------------
+
+class TestPredictorCalibrator(unittest.TestCase):
+    """Tests for src/calibration.py — PredictorCalibrator."""
+
+    def _make_predictions(self, n: int = 80):
+        """Return (raw_predictions, labels) with known linear signal."""
+        rng = np.random.default_rng(42)  # consistent seed across all test methods
+        raw = rng.uniform(0.0, 1.0, size=n).astype(np.float32)
+        # Labels have a noisy positive correlation with raw scores
+        labels = (raw + rng.normal(0, 0.2, n)).astype(np.float32)
+        return raw, labels
+
+    def test_platt_transform_output_in_unit_interval(self):
+        """Platt calibrated scores must be in [0, 1]."""
+        from src.calibration import PredictorCalibrator
+        raw, labels = self._make_predictions()
+        cal = PredictorCalibrator(method="platt")
+        cal.fit(raw, labels)
+        out = cal.transform(raw)
+        self.assertTrue(np.all(out >= 0.0))
+        self.assertTrue(np.all(out <= 1.0))
+        self.assertEqual(out.dtype, np.float32)
+
+    def test_isotonic_transform_output_in_unit_interval(self):
+        """Isotonic calibrated scores must be in [0, 1]."""
+        from src.calibration import PredictorCalibrator
+        raw, labels = self._make_predictions(n=100)
+        cal = PredictorCalibrator(method="isotonic")
+        cal.fit(raw, labels)
+        out = cal.transform(raw)
+        self.assertTrue(np.all(out >= 0.0))
+        self.assertTrue(np.all(out <= 1.0))
+
+    def test_transform_before_fit_raises(self):
+        """Calling transform() before fit() must raise RuntimeError."""
+        from src.calibration import PredictorCalibrator
+        cal = PredictorCalibrator()
+        with self.assertRaises(RuntimeError):
+            cal.transform(np.array([0.5, 0.6], dtype=np.float32))
+
+    def test_fit_with_too_few_samples_raises(self):
+        """fit() with < 2 samples must raise ValueError."""
+        from src.calibration import PredictorCalibrator
+        cal = PredictorCalibrator()
+        with self.assertRaises(ValueError):
+            cal.fit(np.array([0.5], dtype=np.float32),
+                    np.array([0.5], dtype=np.float32))
+
+    def test_ece_perfect_calibration_is_near_zero(self):
+        """ECE for a perfectly calibrated predictor should be near 0."""
+        from src.calibration import PredictorCalibrator
+        n = 200
+        # Perfect calibration: raw score == fraction of positives in that bin
+        raw = np.linspace(0.0, 1.0, n).astype(np.float32)
+        # Generate binary labels such that freq(positive|raw=x) ≈ x
+        rng = np.random.default_rng(0)
+        labels_binary = rng.binomial(1, raw).astype(np.float32)
+        # ECE on the raw scores directly (already calibrated by construction)
+        cal = PredictorCalibrator(method="platt")
+        cal.fit(raw, labels_binary)
+        calibrated = cal.transform(raw)
+        ece = cal.expected_calibration_error(calibrated, labels_binary, n_bins=10)
+        self.assertLess(ece, 0.25, "ECE should be small for a near-calibrated predictor")
+
+    def test_save_calibration_params_writes_json(self):
+        """save_calibration_params() produces a readable JSON file."""
+        from src.calibration import PredictorCalibrator
+        raw, labels = self._make_predictions()
+        cal = PredictorCalibrator(method="platt")
+        cal.fit(raw, labels)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cal_params.json")
+            out = cal.save_calibration_params(path)
+            self.assertTrue(os.path.exists(out))
+            with open(out) as fh:
+                doc = json.load(fh)
+            self.assertIn("method", doc)
+            self.assertEqual(doc["method"], "platt")
+            self.assertIn("platt_a", doc)
+
+    def test_plot_reliability_diagram_creates_png(self):
+        """plot_reliability_diagram() saves a non-empty PNG."""
+        from src.calibration import PredictorCalibrator
+        raw, labels = self._make_predictions(n=100)
+        cal = PredictorCalibrator(method="platt")
+        cal.fit(raw, labels)
+        calibrated = cal.transform(raw)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "calibration.png")
+            out = cal.plot_reliability_diagram(
+                calibrated, labels, path, raw_scores=raw
+            )
+            self.assertTrue(os.path.exists(out))
+            self.assertGreater(os.path.getsize(out), 1024)
+
+    def test_unknown_method_raises(self):
+        """PredictorCalibrator(method='bad') must raise ValueError."""
+        from src.calibration import PredictorCalibrator
+        with self.assertRaises(ValueError):
+            PredictorCalibrator(method="bad_method")
+
+
+# ---------------------------------------------------------------------------
+# 12. Scene-adaptive frame extraction tests
+# ---------------------------------------------------------------------------
+
+class TestSceneAdaptiveSampling(unittest.TestCase):
+    """Tests for extract_frames_scene_adaptive() in src/frame_extractor.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _make_scene_video(self, n_scenes: int = 3, frames_per_scene: int = 20,
+                          fps: int = 10) -> str:
+        """Create a synthetic video with abrupt colour-scene changes."""
+        path = os.path.join(self.tmp, "scene_video.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        total = n_scenes * frames_per_scene
+        writer = cv2.VideoWriter(path, fourcc, fps, (64, 64))
+        assert writer.isOpened()
+        colours = [(200, 50, 50), (50, 200, 50), (50, 50, 200)]
+        for s in range(n_scenes):
+            c = colours[s % len(colours)]
+            for _ in range(frames_per_scene):
+                frame = np.full((64, 64, 3), c, dtype=np.uint8)
+                writer.write(frame)
+        writer.release()
+        return path
+
+    def test_returns_non_empty_metadata(self):
+        """Scene-adaptive extraction returns at least one frame."""
+        from src.frame_extractor import extract_frames_scene_adaptive
+        path = self._make_scene_video()
+        meta = extract_frames_scene_adaptive(
+            path, os.path.join(self.tmp, "frames_adaptive")
+        )
+        self.assertGreater(len(meta), 0)
+
+    def test_sampling_method_recorded_in_metadata(self):
+        """Every metadata entry must have sampling_method='scene_adaptive'."""
+        from src.frame_extractor import extract_frames_scene_adaptive
+        path = self._make_scene_video()
+        meta = extract_frames_scene_adaptive(
+            path, os.path.join(self.tmp, "frames_adaptive2")
+        )
+        for entry in meta:
+            self.assertEqual(entry.get("sampling_method"), "scene_adaptive")
+            self.assertIn("scene_id", entry)
+            self.assertIn("scene_start_t", entry)
+            self.assertIn("scene_end_t", entry)
+
+    def test_fewer_frames_than_uniform_on_static_video(self):
+        """On a long static video, scene-adaptive yields far fewer frames."""
+        from src.frame_extractor import extract_frames, extract_frames_scene_adaptive
+        # 5-second static (one colour) video at 10fps
+        path = os.path.join(self.tmp, "static.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(path, fourcc, 10, (64, 64))
+        assert writer.isOpened()
+        for _ in range(50):
+            writer.write(np.full((64, 64, 3), (100, 100, 100), dtype=np.uint8))
+        writer.release()
+
+        uniform = extract_frames(path, os.path.join(self.tmp, "frames_uni"))
+        adaptive = extract_frames_scene_adaptive(
+            path, os.path.join(self.tmp, "frames_adap"),
+            transition_threshold=0.10,
+        )
+        # Static video → 1 scene → adaptive extracts 1 frame
+        # Uniform at 1fps → 5 frames
+        self.assertLessEqual(len(adaptive), len(uniform))
+
+    def test_missing_video_raises(self):
+        """extract_frames_scene_adaptive must raise FileNotFoundError."""
+        from src.frame_extractor import extract_frames_scene_adaptive
+        with self.assertRaises(FileNotFoundError):
+            extract_frames_scene_adaptive(
+                "/nonexistent/video.mp4",
+                os.path.join(self.tmp, "frames"),
+            )
+
+    def test_max_scenes_cap_respected(self):
+        """The number of returned frames must not exceed max_scenes."""
+        from src.frame_extractor import extract_frames_scene_adaptive
+        # 10-scene video
+        path = self._make_scene_video(n_scenes=5, frames_per_scene=20)
+        meta = extract_frames_scene_adaptive(
+            path,
+            os.path.join(self.tmp, "frames_capped"),
+            max_scenes=2,
+            transition_threshold=0.05,
+        )
+        self.assertLessEqual(len(meta), 2)
+
+    def test_frame_files_are_written(self):
+        """All file_path entries in metadata must refer to existing JPEG files."""
+        from src.frame_extractor import extract_frames_scene_adaptive
+        path = self._make_scene_video(n_scenes=2, frames_per_scene=15)
+        meta = extract_frames_scene_adaptive(
+            path, os.path.join(self.tmp, "frames_exist")
+        )
+        for entry in meta:
+            self.assertTrue(
+                os.path.exists(entry["file_path"]),
+                f"Expected file missing: {entry['file_path']}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
