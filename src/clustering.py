@@ -359,6 +359,66 @@ class VibeClusterer:
         return os.path.abspath(output_path)
 
     # ------------------------------------------------------------------
+    # Cluster quality metrics
+    # ------------------------------------------------------------------
+
+    def cluster_quality(
+        self,
+        embeddings: np.ndarray,
+        labels: np.ndarray,
+    ) -> Dict[str, float]:
+        """
+        Compute cluster quality metrics for a given assignment.
+
+        Returns the **silhouette score** and the **Davies-Bouldin index** —
+        both are proper internal validation criteria that do not require
+        ground-truth labels.
+
+        **Silhouette score** (higher is better, range [-1, 1]):
+            For each point, measures how similar it is to its own cluster
+            compared to other clusters.  A score near +1 means the
+            assignment is dense and well-separated; near 0 means overlapping
+            clusters; near -1 means misassignment.
+
+        **Davies-Bouldin index** (lower is better, range [0, ∞)):
+            Average ratio of intra-cluster scatter to inter-cluster
+            separation.  Penalises elongated or closely-spaced clusters.
+
+        These metrics expose two common failure modes that the elbow/inertia
+        heuristic misses:
+        - K-means partitioning noise in high-dimensional space (all
+          silhouette scores near 0 → clusters are meaningless).
+        - Over-segmentation (k too high → DB index rises sharply).
+
+        Args:
+            embeddings:  ``(N, D)`` float32 L2-normalised embeddings.
+            labels:      Cluster label array ``(N,)`` from :meth:`fit`.
+
+        Returns:
+            Dict with keys ``"silhouette"`` and ``"davies_bouldin"``.
+
+        Raises:
+            RuntimeError: if the number of unique labels is < 2.
+        """
+        from sklearn.metrics import silhouette_score, davies_bouldin_score
+
+        n_unique = len(set(labels))
+        if n_unique < 2:
+            raise RuntimeError(
+                f"cluster_quality requires ≥2 unique labels; got {n_unique}."
+            )
+
+        sil = float(silhouette_score(embeddings, labels, metric="cosine"))
+        db  = float(davies_bouldin_score(embeddings, labels))
+
+        logger.info(
+            "Cluster quality: silhouette=%.4f (higher better), "
+            "davies_bouldin=%.4f (lower better).",
+            sil, db,
+        )
+        return {"silhouette": sil, "davies_bouldin": db}
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -415,8 +475,18 @@ class VibeClusterer:
 
 def auto_n_clusters(embeddings: np.ndarray, max_k: int = 10) -> int:
     """
-    Suggest a number of clusters using the elbow heuristic (largest drop in
-    inertia per added cluster).
+    Suggest a number of clusters using the **silhouette score**.
+
+    Unlike the elbow/inertia heuristic (which produces a monotonically
+    decreasing curve with no reliable inflection point in high-dimensional
+    space), the silhouette score is a proper cluster-validity index with a
+    meaningful maximum at the "right" k.
+
+    We fit K-means for ``k ∈ [2, max_k]``, compute the silhouette score for
+    each k using cosine distance (appropriate for L2-normalised embeddings),
+    and return the k with the highest silhouette score.
+
+    Falls back to k=2 if only one k can be tested.
 
     Args:
         embeddings:  ``(N, D)`` float32 L2-normalised embeddings.
@@ -425,28 +495,29 @@ def auto_n_clusters(embeddings: np.ndarray, max_k: int = 10) -> int:
     Returns:
         Suggested integer *k* in ``[2, max_k]``.
     """
+    from sklearn.metrics import silhouette_score
+
     n = embeddings.shape[0]
     max_k = min(max_k, n - 1)
     if max_k < 2:
         return 2
 
-    inertias = []
+    best_k = 2
+    best_sil = -1.0
     ks = list(range(2, max_k + 1))
+    scores = []
+
     for k in ks:
         km = KMeans(n_clusters=k, random_state=42, n_init=5)
-        km.fit(embeddings)
-        inertias.append(km.inertia_)
-
-    # Largest relative drop
-    drops = [inertias[i - 1] - inertias[i] for i in range(1, len(inertias))]
-    if not drops:
-        # Only one k was tested – return it directly
-        return ks[0]
-    best_idx = int(np.argmax(drops))
-    suggested_k = ks[best_idx + 1]  # k that caused the largest drop
+        labels = km.fit_predict(embeddings)
+        sil = float(silhouette_score(embeddings, labels, metric="cosine"))
+        scores.append(sil)
+        if sil > best_sil:
+            best_sil = sil
+            best_k = k
 
     logger.info(
-        "auto_n_clusters: tested k=%s, inertias=%s → suggested k=%d.",
-        ks, [round(x, 1) for x in inertias], suggested_k,
+        "auto_n_clusters (silhouette): tested k=%s, scores=%s → best k=%d (sil=%.4f).",
+        ks, [round(s, 4) for s in scores], best_k, best_sil,
     )
-    return suggested_k
+    return best_k

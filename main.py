@@ -6,13 +6,19 @@ Mood & Style Embedding Pipeline.
 
 Steps
 -----
-1. (Optional) Download sample videos.
-2. Extract frames from all videos found in ``data/videos/``.
-3. Compute CLIP embeddings for all frames.
-4. Calculate pairwise cosine-similarity matrix.
-5. Run top-5 retrieval for at least 3 query frames.
-6. Generate visualisations (heatmap, bar chart, retrieval grids).
-7. Write a Markdown similarity report.
+1.  (Optional) Download sample videos.
+2.  Extract frames from all videos found in ``data/videos/``.
+3.  Compute CLIP embeddings for all frames.
+3b. Content-adaptive deduplication — remove near-duplicate frames.
+4.  Calculate pairwise cosine-similarity matrix.
+5.  Run top-5 retrieval for at least 3 query frames.
+6.  Generate visualisations (heatmap, bar chart, retrieval grids).
+7.  Write a Markdown similarity report.
+8.  Affective scoring (single-prompt + multi-prompt ensemble).
+9.  Vibe clustering with silhouette-based quality metrics.
+10. Temporal analysis with consecutive-frame transition detection.
+11. Vibe–performance regression (synthetic CTR prediction).
+12. Write structured run manifest (run_manifest.json).
 
 Usage
 -----
@@ -58,7 +64,7 @@ from src.visualization import (
     plot_top_k_grid,
     generate_similarity_report,
 )
-from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+from src.affective_scoring import AffectiveScorer, DEFAULT_AXES, MULTI_PROMPT_AXES
 from src.clustering import VibeClusterer, auto_n_clusters
 from src.temporal_analysis import TemporalAnalyser
 from src.performance_predictor import (
@@ -66,6 +72,8 @@ from src.performance_predictor import (
     build_feature_names,
     VibePerformancePredictor,
 )
+from src.frame_deduplication import deduplicate_frames
+from src.experiment_manifest import PipelineManifest
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -133,13 +141,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         metavar="K",
-        help="Number of vibe clusters (default: 0 = auto-detect).",
+        help="Number of vibe clusters (default: 0 = auto-detect via silhouette).",
+    )
+    p.add_argument(
+        "--dedup-threshold",
+        type=float,
+        default=0.97,
+        metavar="TAU",
+        help=(
+            "Cosine-similarity threshold for near-duplicate frame removal "
+            "(default: 0.97).  Set to 1.0 to disable deduplication."
+        ),
     )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # Initialise run manifest — collects all metrics for reproducibility
+    manifest = PipelineManifest(
+        config={
+            "model": args.model,
+            "interval_seconds": args.interval,
+            "max_frames": args.max_frames,
+            "dedup_threshold": args.dedup_threshold,
+            "n_clusters_arg": args.n_clusters,
+        }
+    )
 
     # -----------------------------------------------------------------------
     # Step 1 – Download sample videos
@@ -208,6 +237,46 @@ def main() -> None:
     assert not (embeddings != embeddings).any(), "Embeddings must not contain NaN."
     assert len(index) == embeddings.shape[0], "Index length must match embedding count."
 
+    manifest.record(
+        "embeddings",
+        shape=list(embeddings.shape),
+        dtype=str(embeddings.dtype),
+        model=args.model,
+        n_frames_in=len(metadata),
+        n_frames_embedded=len(index),
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 3b – Content-adaptive frame deduplication
+    #
+    # Remove near-duplicate frames caused by slow pans, static shots, or
+    # fades.  Without this step the similarity matrix shows block-diagonal
+    # artifacts driven by temporal proximity rather than style, cluster sizes
+    # are biased toward slower-paced videos, and temporal coherence scores
+    # are artificially inflated.
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 3b: Content-adaptive frame deduplication (tau=%.3f) ===",
+                args.dedup_threshold)
+    if args.dedup_threshold < 1.0:
+        embeddings, index, kept_mask = deduplicate_frames(
+            embeddings, index, similarity_threshold=args.dedup_threshold
+        )
+        print(
+            f"\n── Deduplication: kept {len(index)} / {kept_mask.shape[0]} frames "
+            f"({100.0 * len(index) / max(kept_mask.shape[0], 1):.1f}%) ──\n"
+        )
+        manifest.record(
+            "deduplication",
+            threshold=args.dedup_threshold,
+            n_before=int(kept_mask.shape[0]),
+            n_after=len(index),
+            reduction_pct=round(
+                100.0 * (kept_mask.shape[0] - len(index)) / max(kept_mask.shape[0], 1), 2
+            ),
+        )
+    else:
+        logger.info("Deduplication skipped (--dedup-threshold=1.0).")
+
     # -----------------------------------------------------------------------
     # Step 4 – Compute pairwise similarity
     # -----------------------------------------------------------------------
@@ -221,6 +290,8 @@ def main() -> None:
     for k, v in stats.items():
         print(f"  {k}: {v:.4f}")
     print()
+
+    manifest.record("similarity", **stats, n_frames=len(index))
 
     # -----------------------------------------------------------------------
     # Step 5 – Top-k retrieval for query frames
@@ -295,16 +366,27 @@ def main() -> None:
             print(f"  {axis_name:12s}: {float(scores.mean()):+.4f}")
         print()
 
-        video_scores = scorer.score_video_level(frame_scores, index)
+        # Multi-prompt ensemble scoring (more reliable than single-prompt)
+        print("── Ensemble affective scores (5 prompts/pole, with confidence) ──")
+        ens_scores, ens_confidence = scorer.score_frames_ensemble(
+            embeddings, multi_prompt_axes=MULTI_PROMPT_AXES, index=index
+        )
+        for axis_name, scores in ens_scores.items():
+            conf = ens_confidence[axis_name].mean()
+            print(f"  {axis_name:12s}: {float(scores.mean()):+.4f}  "
+                  f"(confidence std={conf:.4f})")
+        print()
+
+        video_scores = scorer.score_video_level(ens_scores, index)
 
         affective_json = scorer.save_scores(
-            frame_scores, index,
+            ens_scores, index,
             output_path=os.path.join(OUTPUTS_DIR, "affective_scores.json"),
         )
         print(f"  Affective scores JSON: {affective_json}")
 
         affective_heatmap = scorer.plot_heatmap(
-            frame_scores, index,
+            ens_scores, index,
             output_path=os.path.join(OUTPUTS_DIR, "affective_heatmap.png"),
         )
         print(f"  Affective heatmap:     {affective_heatmap}")
@@ -314,6 +396,18 @@ def main() -> None:
             output_path=os.path.join(OUTPUTS_DIR, "affective_radar.png"),
         )
         print(f"  Affective radar:       {radar_path}")
+
+        manifest.record(
+            "affective_scoring",
+            axes=list(ens_scores.keys()),
+            mean_confidence={k: round(float(v.mean()), 4) for k, v in ens_confidence.items()},
+        )
+        manifest.add_artifact(affective_json, "Frame-level ensemble affective scores")
+        manifest.add_artifact(affective_heatmap, "Affective score heatmap (axes x frames)")
+        manifest.add_artifact(radar_path, "Affective radar chart (per-video profiles)")
+
+        # Update frame_scores to use ensemble for downstream modules
+        frame_scores = ens_scores
 
     except (RuntimeError, ValueError, OSError, ImportError) as exc:
         logger.warning("Affective scoring step failed (%s); continuing.", exc)
@@ -332,7 +426,13 @@ def main() -> None:
         clusterer = VibeClusterer(n_clusters=k)
         labels = clusterer.fit(embeddings)
 
+        # Cluster quality metrics (silhouette + Davies-Bouldin)
+        quality = clusterer.cluster_quality(embeddings, labels)
         print(f"\n── Vibe clustering: {k} clusters, {n_frames} frames ──")
+        print(f"  Silhouette score:   {quality['silhouette']:.4f}  "
+              f"(higher better, >0.5 = well-separated)")
+        print(f"  Davies-Bouldin idx: {quality['davies_bouldin']:.4f}  "
+              f"(lower better, <1.0 = compact clusters)")
         summary = clusterer.cluster_summary(labels, index, embeddings=embeddings)
         for cid, info in summary.items():
             print(f"  Cluster {cid}: {info['size']} frames  "
@@ -353,6 +453,15 @@ def main() -> None:
         )
         print(f"  Cluster assignments: {assign_path}")
 
+        manifest.record(
+            "clustering",
+            n_clusters=k,
+            silhouette=round(quality["silhouette"], 4),
+            davies_bouldin=round(quality["davies_bouldin"], 4),
+            cluster_sizes={str(cid): info["size"] for cid, info in summary.items()},
+        )
+        manifest.add_artifact(scatter_path, "2-D PCA vibe cluster scatter plot")
+
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("Clustering step failed (%s); continuing.", exc)
 
@@ -364,13 +473,18 @@ def main() -> None:
         ta = TemporalAnalyser(window=3)
         temporal_curve = ta.compute_temporal_curve(embeddings, index)
 
-        transitions = ta.detect_scene_transitions(temporal_curve, threshold=0.12)
+        # Use consecutive-frame similarities for scene-cut detection
+        # (more accurate than detecting drops in the windowed curve).
+        consec_sims = ta.compute_consecutive_similarities(embeddings, index)
+        transitions = ta.detect_scene_transitions(consec_sims, threshold=0.12)
         pacing = ta.pacing_score(temporal_curve)
         coherence = ta.coherence_score(temporal_curve)
+        pacing_rate = ta.pacing_rate_per_second(transitions, index)
 
         print(f"\n── Temporal analysis ──")
         print(f"  Coherence score:     {coherence:+.4f}  (higher = smoother narrative)")
-        print(f"  Pacing score:        {pacing:.6f}  (higher = more dynamic editing)")
+        print(f"  Pacing score:        {pacing:.6f}  (variance of windowed curve)")
+        print(f"  Pacing rate:         {pacing_rate:.4f} cuts/second")
         print(f"  Scene transitions:   {len(transitions)} detected at frames {transitions[:10]}")
         print()
 
@@ -398,6 +512,17 @@ def main() -> None:
             output_path=os.path.join(OUTPUTS_DIR, "temporal_stats.json"),
         )
         print(f"  Temporal JSON: {temporal_json}")
+
+        manifest.record(
+            "temporal_analysis",
+            overall_coherence=round(coherence, 4),
+            overall_pacing=round(pacing, 6),
+            pacing_rate_per_second=round(pacing_rate, 4),
+            n_transitions=len(transitions),
+            per_video={vid: {k: round(v, 4) for k, v in s.items()}
+                       for vid, s in per_vid_stats.items()},
+        )
+        manifest.add_artifact(arc_path, "Narrative arc – temporal similarity curve")
 
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("Temporal analysis step failed (%s); continuing.", exc)
@@ -457,9 +582,26 @@ def main() -> None:
             )
             print(f"  Model JSON:        {model_json}")
 
+            manifest.record(
+                "performance_predictor",
+                model_type="ridge",
+                mean_spearman=round(cv_results["mean_spearman"], 4),
+                std_spearman=round(cv_results["std_spearman"], 4),
+                mean_rmse=round(cv_results["mean_rmse"], 4),
+                n_features=features.shape[1],
+                top_features={fname: round(score, 4) for fname, score in importance},
+            )
+
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("Performance regression step failed (%s); continuing.", exc)
 
+    # -----------------------------------------------------------------------
+    # Step 12 – Save run manifest
+    # -----------------------------------------------------------------------
+    manifest_path = os.path.join(OUTPUTS_DIR, "run_manifest.json")
+    manifest.save(manifest_path)
+    print(f"\n  Run manifest: {os.path.abspath(manifest_path)}")
+    print(f"\n{manifest.summary()}")
     print("\n✓ Pipeline complete.")
 
 

@@ -1774,5 +1774,390 @@ class TestPerformancePredictor(unittest.TestCase):
         self.assertFalse(np.isnan(out).any())
 
 
+# ---------------------------------------------------------------------------
+# 10. Frame deduplication tests
+# ---------------------------------------------------------------------------
+
+class TestFrameDeduplication(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    @staticmethod
+    def _unit_embeddings(n: int, dim: int = 8, seed: int = 42) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    @staticmethod
+    def _make_index(n: int, video_id: str = "v1") -> list:
+        return [
+            {"video_id": video_id, "frame_idx": i, "timestamp": float(i)}
+            for i in range(n)
+        ]
+
+    def test_deduplicate_removes_exact_duplicates(self):
+        """Identical consecutive frames should be collapsed to one."""
+        from src.frame_deduplication import deduplicate_frames
+
+        base = self._unit_embeddings(1)
+        # 5 copies of the same vector
+        embs = np.vstack([base] * 5)
+        index = self._make_index(5)
+
+        dedup_embs, dedup_idx, mask = deduplicate_frames(embs, index, similarity_threshold=0.97)
+
+        # Only the first should be kept
+        self.assertEqual(dedup_embs.shape[0], 1)
+        self.assertEqual(len(dedup_idx), 1)
+        self.assertEqual(int(mask.sum()), 1)
+
+    def test_deduplicate_keeps_distinct_frames(self):
+        """Orthogonal embeddings should all be retained."""
+        from src.frame_deduplication import deduplicate_frames
+
+        # 8 orthogonal unit vectors in 8-D
+        embs = np.eye(8, dtype=np.float32)
+        index = self._make_index(8)
+
+        dedup_embs, dedup_idx, mask = deduplicate_frames(embs, index, similarity_threshold=0.97)
+
+        self.assertEqual(dedup_embs.shape[0], 8)
+        self.assertEqual(int(mask.sum()), 8)
+
+    def test_deduplicate_output_alignment(self):
+        """dedup_index[i] must correspond to dedup_embeddings[i]."""
+        from src.frame_deduplication import deduplicate_frames
+
+        embs = self._unit_embeddings(10)
+        index = self._make_index(10)
+
+        dedup_embs, dedup_idx, mask = deduplicate_frames(embs, index, similarity_threshold=0.5)
+
+        kept_positions = [i for i, b in enumerate(mask) if b]
+        for local_i, global_i in enumerate(kept_positions):
+            np.testing.assert_array_almost_equal(
+                dedup_embs[local_i], embs[global_i], decimal=5
+            )
+            self.assertEqual(dedup_idx[local_i]["frame_idx"], index[global_i]["frame_idx"])
+
+    def test_deduplicate_invalid_threshold_raises(self):
+        from src.frame_deduplication import deduplicate_frames
+
+        embs = self._unit_embeddings(4)
+        index = self._make_index(4)
+
+        with self.assertRaises(ValueError):
+            deduplicate_frames(embs, index, similarity_threshold=0.0)
+        with self.assertRaises(ValueError):
+            deduplicate_frames(embs, index, similarity_threshold=1.5)
+
+    def test_deduplicate_empty_raises(self):
+        from src.frame_deduplication import deduplicate_frames
+
+        with self.assertRaises(ValueError):
+            deduplicate_frames(np.zeros((0, 8), dtype=np.float32), [], 0.97)
+
+    def test_compute_novelty_scores_shape_and_range(self):
+        from src.frame_deduplication import compute_novelty_scores
+
+        embs = self._unit_embeddings(6)
+        index = self._make_index(6)
+        novelty = compute_novelty_scores(embs, index)
+
+        self.assertEqual(novelty.shape, (6,))
+        # First frame has novelty 1.0 by definition
+        self.assertAlmostEqual(float(novelty[0]), 1.0, places=5)
+
+    def test_compute_novelty_identical_frames(self):
+        """Identical consecutive frames should have novelty 0."""
+        from src.frame_deduplication import compute_novelty_scores
+
+        base = self._unit_embeddings(1)
+        embs = np.vstack([base, base, base])
+        index = self._make_index(3)
+        novelty = compute_novelty_scores(embs, index)
+
+        self.assertAlmostEqual(float(novelty[1]), 0.0, places=4)
+        self.assertAlmostEqual(float(novelty[2]), 0.0, places=4)
+
+    def test_select_diverse_frames_returns_correct_count(self):
+        from src.frame_deduplication import select_diverse_frames
+
+        embs = self._unit_embeddings(12)
+        index = self._make_index(12)
+        sel_embs, sel_idx, sel_pos = select_diverse_frames(embs, index, n_select=5)
+
+        self.assertEqual(sel_embs.shape[0], 5)
+        self.assertEqual(len(sel_idx), 5)
+        self.assertEqual(len(sel_pos), 5)
+        # Positions should be sorted
+        self.assertEqual(sel_pos, sorted(sel_pos))
+
+    def test_select_diverse_frames_alignment(self):
+        """selected_embeddings[i] must correspond to embeddings[selected_positions[i]]."""
+        from src.frame_deduplication import select_diverse_frames
+
+        embs = self._unit_embeddings(10)
+        index = self._make_index(10)
+        sel_embs, sel_idx, sel_pos = select_diverse_frames(embs, index, n_select=4)
+
+        for local_i, global_i in enumerate(sel_pos):
+            np.testing.assert_array_almost_equal(
+                sel_embs[local_i], embs[global_i], decimal=5
+            )
+
+
+# ---------------------------------------------------------------------------
+# 11. Experiment manifest tests
+# ---------------------------------------------------------------------------
+
+class TestExperimentManifest(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_manifest_save_creates_json(self):
+        from src.experiment_manifest import PipelineManifest
+
+        m = PipelineManifest(run_id="test_run_001")
+        m.record("step_a", n_frames=10, model="clip")
+        out = os.path.join(self.tmp, "manifest.json")
+        m.save(out)
+
+        self.assertTrue(os.path.exists(out))
+        with open(out) as fh:
+            import json as json_mod
+            data = json_mod.load(fh)
+        self.assertEqual(data["run_id"], "test_run_001")
+        self.assertIn("step_a", data["modules"])
+        self.assertEqual(data["modules"]["step_a"]["n_frames"], 10)
+
+    def test_manifest_get(self):
+        from src.experiment_manifest import PipelineManifest
+
+        m = PipelineManifest()
+        m.record("embedding", shape=[50, 512], dtype="float32")
+        result = m.get("embedding")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["shape"], [50, 512])
+
+    def test_manifest_add_artifact(self):
+        from src.experiment_manifest import PipelineManifest
+
+        m = PipelineManifest()
+        # Create a real file so size can be recorded
+        artifact = os.path.join(self.tmp, "dummy.png")
+        with open(artifact, "wb") as fh:
+            fh.write(b"\x89PNG\r\n" + b"\x00" * 100)
+        m.add_artifact(artifact, "A dummy PNG")
+        out = os.path.join(self.tmp, "manifest.json")
+        m.save(out)
+
+        with open(out) as fh:
+            import json as json_mod
+            data = json_mod.load(fh)
+        self.assertEqual(len(data["artifacts"]), 1)
+        self.assertGreater(data["artifacts"][0]["size_bytes"], 0)
+
+    def test_manifest_numpy_types_serialisable(self):
+        """NumPy scalar types must be auto-cast to native Python for JSON."""
+        from src.experiment_manifest import PipelineManifest
+
+        m = PipelineManifest()
+        m.record("test", silhouette=np.float32(0.42), n=np.int32(10))
+        out = os.path.join(self.tmp, "manifest_np.json")
+        # Should not raise TypeError
+        m.save(out)
+        with open(out) as fh:
+            import json as json_mod
+            data = json_mod.load(fh)
+        self.assertAlmostEqual(data["modules"]["test"]["silhouette"], 0.42, places=4)
+
+    def test_manifest_summary_contains_run_id(self):
+        from src.experiment_manifest import PipelineManifest
+
+        m = PipelineManifest(run_id="abc123")
+        m.record("a", x=1)
+        summary = m.summary()
+        self.assertIn("abc123", summary)
+        self.assertIn("[a]", summary)
+
+
+# ---------------------------------------------------------------------------
+# 12. Senior-level improvement tests (dedup, silhouette, consecutive sims)
+# ---------------------------------------------------------------------------
+
+class TestSeniorImprovements(unittest.TestCase):
+    """Tests that validate the senior-level fixes and additions."""
+
+    @staticmethod
+    def _unit_embeddings(n: int, dim: int = 8, seed: int = 0) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    @staticmethod
+    def _make_index(n: int, n_videos: int = 2) -> list:
+        return [
+            {
+                "video_id": f"v{i % n_videos}",
+                "frame_idx": i // n_videos,
+                "timestamp": float(i),
+            }
+            for i in range(n)
+        ]
+
+    def test_embedding_index_no_gap_when_all_files_exist(self):
+        """embedding_idx must be contiguous 0..N-1 with no gaps."""
+        from src.embeddings import compute_and_save_embeddings
+        import tempfile
+
+        # Create real image files
+        tmp = tempfile.mkdtemp()
+        meta = []
+        for i in range(4):
+            p = os.path.join(tmp, f"f{i}.jpg")
+            img = Image.new("RGB", (16, 16), (i * 60 % 256, i * 30 % 256, 0))
+            img.save(p, "JPEG")
+            meta.append({"file_path": p, "video_id": "v1",
+                          "frame_idx": i, "timestamp": float(i)})
+
+        with patch("src.embeddings.CLIPProcessor.from_pretrained") as mock_proc, \
+             patch("src.embeddings.CLIPModel.from_pretrained") as mock_model:
+            import torch
+            mm = MagicMock()
+            mm.eval.return_value = mm
+            mm.to.return_value = mm
+            def _feat(**kw):
+                n = kw["pixel_values"].shape[0]
+                f = torch.randn(n, 8)
+                return f / f.norm(dim=-1, keepdim=True)
+            mm.get_image_features.side_effect = _feat
+            mock_model.return_value = mm
+            mp = MagicMock()
+            def _proc(*a, images=None, **kw):
+                n = len(images)
+                return {"pixel_values": torch.zeros(n, 3, 16, 16)}
+            mp.side_effect = _proc
+            mock_proc.return_value = mp
+
+            embs, idx = compute_and_save_embeddings(meta, tmp)
+
+        expected_indices = list(range(len(idx)))
+        actual_indices = [e["embedding_idx"] for e in idx]
+        self.assertEqual(actual_indices, expected_indices,
+                         "embedding_idx must be 0,1,2,...,N-1 with no gaps")
+
+    def test_vectorized_inter_video_stats_matches_naive(self):
+        """Vectorised compute_inter_video_stats must match the naive O(N²) loop."""
+        from src.similarity import compute_inter_video_stats, cosine_similarity_matrix
+
+        embs = self._unit_embeddings(12)
+        index = self._make_index(12, n_videos=3)
+        sim = cosine_similarity_matrix(embs)
+        stats = compute_inter_video_stats(sim, index)
+
+        # Naive reference
+        n = sim.shape[0]
+        vid_ids = [e["video_id"] for e in index]
+        w, c = [], []
+        for i in range(n):
+            for j in range(i + 1, n):
+                (w if vid_ids[i] == vid_ids[j] else c).append(float(sim[i, j]))
+        all_vals = w + c
+        self.assertAlmostEqual(stats["overall_mean"], float(np.mean(all_vals)), places=4)
+        self.assertAlmostEqual(stats["within_video_mean"], float(np.mean(w)), places=4)
+        self.assertAlmostEqual(stats["cross_video_mean"], float(np.mean(c)), places=4)
+
+    def test_consecutive_similarities_shape_and_range(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        embs = self._unit_embeddings(8)
+        index = self._make_index(8, n_videos=1)
+        ta = TemporalAnalyser(window=2)
+        consec = ta.compute_consecutive_similarities(embs, index)
+
+        self.assertEqual(consec.shape, (8,))
+        # Last frame → 1.0 (no successor)
+        self.assertAlmostEqual(float(consec[-1]), 1.0, places=5)
+        # All values in [-1, 1]
+        self.assertTrue((consec >= -1.0).all())
+        self.assertTrue((consec <= 1.0).all())
+
+    def test_consecutive_similarities_identical_frames(self):
+        """Consecutive identical frames must have similarity 1.0."""
+        from src.temporal_analysis import TemporalAnalyser
+
+        base = self._unit_embeddings(1, seed=7)
+        embs = np.vstack([base, base, base, base])
+        index = [{"video_id": "v0", "frame_idx": i, "timestamp": float(i)}
+                 for i in range(4)]
+        ta = TemporalAnalyser()
+        consec = ta.compute_consecutive_similarities(embs, index)
+
+        for i in range(3):  # frames 0,1,2 each identical to next
+            self.assertAlmostEqual(float(consec[i]), 1.0, places=4)
+
+    def test_pacing_rate_per_second_calculation(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        # 5 frames at 1s intervals in one video, with 2 transitions at positions 2, 4
+        index = [{"video_id": "v0", "frame_idx": i, "timestamp": float(i)}
+                 for i in range(5)]
+        ta = TemporalAnalyser()
+        rate = ta.pacing_rate_per_second(transitions=[2, 4], index=index, video_id="v0")
+
+        # duration = 4s (0 to 4), 2 transitions → 0.5 cuts/s
+        self.assertAlmostEqual(rate, 0.5, places=4)
+
+    def test_pacing_rate_zero_transitions(self):
+        from src.temporal_analysis import TemporalAnalyser
+
+        index = [{"video_id": "v0", "frame_idx": i, "timestamp": float(i)}
+                 for i in range(4)]
+        ta = TemporalAnalyser()
+        rate = ta.pacing_rate_per_second(transitions=[], index=index)
+
+        self.assertEqual(rate, 0.0)
+
+    def test_cluster_quality_returns_valid_scores(self):
+        from src.clustering import VibeClusterer
+
+        embs = self._unit_embeddings(20, dim=16)
+        clust = VibeClusterer(n_clusters=3)
+        labels = clust.fit(embs)
+        quality = clust.cluster_quality(embs, labels)
+
+        self.assertIn("silhouette", quality)
+        self.assertIn("davies_bouldin", quality)
+        # Silhouette in [-1, 1]
+        self.assertGreaterEqual(quality["silhouette"], -1.0)
+        self.assertLessEqual(quality["silhouette"], 1.0)
+        # Davies-Bouldin ≥ 0
+        self.assertGreaterEqual(quality["davies_bouldin"], 0.0)
+
+    def test_auto_n_clusters_uses_silhouette(self):
+        """auto_n_clusters should return a value in [2, max_k]."""
+        from src.clustering import auto_n_clusters
+
+        embs = self._unit_embeddings(30, dim=16)
+        k = auto_n_clusters(embs, max_k=6)
+
+        self.assertGreaterEqual(k, 2)
+        self.assertLessEqual(k, 6)
+
+    def test_multi_prompt_axes_keys_match_default(self):
+        """MULTI_PROMPT_AXES should cover the same axes as DEFAULT_AXES."""
+        from src.affective_scoring import DEFAULT_AXES, MULTI_PROMPT_AXES
+
+        self.assertEqual(set(DEFAULT_AXES.keys()), set(MULTI_PROMPT_AXES.keys()))
+        for axis, (pos_prompts, neg_prompts) in MULTI_PROMPT_AXES.items():
+            self.assertEqual(len(pos_prompts), 5,
+                             f"Axis '{axis}' must have exactly 5 positive prompts")
+            self.assertEqual(len(neg_prompts), 5,
+                             f"Axis '{axis}' must have exactly 5 negative prompts")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

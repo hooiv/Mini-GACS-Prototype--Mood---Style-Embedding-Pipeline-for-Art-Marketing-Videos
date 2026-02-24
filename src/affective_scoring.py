@@ -61,6 +61,115 @@ DEFAULT_AXES: Dict[str, Tuple[str, str]] = {
                    "a relaxed, serene, tension-free scene"),
 }
 
+# ---------------------------------------------------------------------------
+# Multi-prompt axis definitions (5 phrasings per pole)
+#
+# Using a single prompt per pole risks conflating CLIP's response to specific
+# words (e.g. "golden") with the underlying affective concept.  Ensembling
+# multiple semantically-equivalent prompts and averaging their embeddings
+# (in embedding space, before computing similarity) cancels per-prompt noise
+# and yields a more stable axis direction — the same technique used in the
+# original CLIP zero-shot classification paper (Radford et al. 2021, §3.1).
+# ---------------------------------------------------------------------------
+MULTI_PROMPT_AXES: Dict[str, Tuple[List[str], List[str]]] = {
+    "energy": (
+        [
+            "an energetic, dynamic, fast-paced scene with motion and action",
+            "a vibrant, kinetic, high-intensity visual",
+            "explosive movement and dynamic energy in the frame",
+            "fast cuts, motion blur, action and excitement",
+            "a high-energy advertisement with rapid visual transitions",
+        ],
+        [
+            "a calm, still, peaceful and quiet scene",
+            "a serene, slow, meditative visual with no movement",
+            "motionless, static, tranquil imagery",
+            "a still life photograph with no energy or motion",
+            "a slow-paced, contemplative, restful scene",
+        ],
+    ),
+    "warmth": (
+        [
+            "a warm, golden, sun-lit scene bathed in warm orange tones",
+            "a cozy, amber-lit interior with warm, inviting colours",
+            "sunset hues, warm reds and yellows, a welcoming atmosphere",
+            "golden-hour lighting with a warm, comfortable mood",
+            "a scene with warm colour grading, orange and yellow tones",
+        ],
+        [
+            "a cold, blue-toned, icy scene with cool lighting",
+            "a clinical, sterile environment with cool white light",
+            "frozen, wintry, pale blue and grey colour palette",
+            "a cold night scene with blue-tinted shadows",
+            "a scene with cold colour grading, blue and teal tones",
+        ],
+    ),
+    "complexity": (
+        [
+            "a visually complex, highly detailed, densely textured scene",
+            "a busy, crowded frame packed with visual information",
+            "intricate patterns, many overlapping elements, visual noise",
+            "a chaotic, layered composition with numerous objects",
+            "highly detailed fine art with complex visual structure",
+        ],
+        [
+            "a minimalist, clean, uncluttered scene with empty space",
+            "simple geometric shapes on a plain background",
+            "a spartan composition with a single subject and no distractions",
+            "negative space, clean lines, minimal visual elements",
+            "a plain, empty, featureless background",
+        ],
+    ),
+    "luxury": (
+        [
+            "an opulent, high-end, luxurious aesthetic with gold and marble",
+            "a premium, exclusive product in an elegant setting",
+            "haute couture fashion, fine jewellery, luxury brand imagery",
+            "a sophisticated, polished, aspirational visual",
+            "rich materials, soft lighting, and a refined, tasteful aesthetic",
+        ],
+        [
+            "a raw, gritty, low-budget aesthetic with rough textures",
+            "a DIY, home-made, unpolished visual",
+            "cheap materials, harsh lighting, and an unrefined look",
+            "a rough, industrial, low-production-value scene",
+            "a basic, utilitarian environment with no aesthetic polish",
+        ],
+    ),
+    "joy": (
+        [
+            "a joyful, happy, uplifting scene full of smiles and laughter",
+            "people celebrating, radiating happiness and positive energy",
+            "bright, cheerful colours and a feel-good, optimistic mood",
+            "a sunny, carefree, delightful visual experience",
+            "warmth and happiness, children playing, pure joy",
+        ],
+        [
+            "a dark, melancholic, sad and sorrowful scene",
+            "grief, loneliness, and emotional pain captured visually",
+            "a gloomy, overcast, desaturated scene with a heavy mood",
+            "despair, isolation, and sadness in a bleak environment",
+            "a sombre, muted, emotionally heavy visual",
+        ],
+    ),
+    "tension": (
+        [
+            "a tense, dramatic, suspenseful scene with high stakes",
+            "an ominous, foreboding visual with a sense of danger",
+            "dark shadows, dramatic contrast, and a threatening atmosphere",
+            "a thriller or horror visual with palpable tension",
+            "conflict, confrontation, and nervous anticipation",
+        ],
+        [
+            "a relaxed, serene, tension-free and peaceful scene",
+            "a gentle, safe, comfortable environment with no threat",
+            "an idyllic, stress-free scene of calm and contentment",
+            "soft lighting, gentle colours, and a totally relaxed mood",
+            "a harmonious, conflict-free scene full of ease and calm",
+        ],
+    ),
+}
+
 
 class AffectiveScorer:
     """
@@ -179,6 +288,107 @@ class AffectiveScorer:
             frame_embeddings.shape[0], len(axis_scores),
         )
         return axis_scores
+
+    def score_frames_ensemble(
+        self,
+        frame_embeddings: np.ndarray,
+        multi_prompt_axes: Optional[Dict[str, Tuple[List[str], List[str]]]] = None,
+        index: Optional[List[Dict]] = None,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """
+        Multi-prompt ensembled affective scoring with confidence estimates.
+
+        Single-prompt probing conflates CLIP's response to specific word
+        choices (e.g. "golden") with the underlying affective concept.
+        This method encodes *K* positive prompts and *K* negative prompts per
+        axis, averages the resulting text embeddings (in embedding space,
+        before computing similarity), and scores each frame against the
+        averaged anchor vectors.
+
+        In addition it computes a **confidence score** per axis per frame:
+        the standard deviation of scores across the *K* individual prompt
+        pairs.  Low std → the axis direction is stable regardless of phrasing
+        (high confidence); high std → prompt wording strongly influences the
+        score (treat the result with scepticism).
+
+        This directly mirrors the ensemble technique from the original CLIP
+        zero-shot classification paper (Radford et al. 2021, §3.1).
+
+        Args:
+            frame_embeddings:   Float32 ``(N, D)`` L2-normalised image embeddings.
+            multi_prompt_axes:  Dict ``{axis: ([pos_prompts], [neg_prompts])}``.
+                                Defaults to :data:`MULTI_PROMPT_AXES`.
+            index:              Ignored (kept for API symmetry).
+
+        Returns:
+            Tuple ``(mean_scores, confidence_scores)`` where both are dicts
+            mapping axis name → float32 ``(N,)`` array.
+
+            - *mean_scores*: ensemble-averaged axis score for each frame.
+              Range ``[-2, 2]``.
+            - *confidence_scores*: per-frame std of scores across prompt pairs.
+              Lower = more confident axis direction.
+
+        Raises:
+            ValueError: if ``frame_embeddings`` is not 2-D or is empty.
+        """
+        if frame_embeddings.ndim != 2 or frame_embeddings.shape[0] == 0:
+            raise ValueError(
+                f"Expected 2-D non-empty array; got shape {frame_embeddings.shape}."
+            )
+
+        axes_def = multi_prompt_axes or MULTI_PROMPT_AXES
+        n = frame_embeddings.shape[0]
+        mean_scores: Dict[str, np.ndarray] = {}
+        confidence_scores: Dict[str, np.ndarray] = {}
+
+        for axis_name, (pos_prompts, neg_prompts) in axes_def.items():
+            # Encode all positive and negative prompts at once
+            all_prompts = pos_prompts + neg_prompts
+            all_embs = self.encode_text(all_prompts)  # (2K, D)
+            k = len(pos_prompts)
+            pos_embs = all_embs[:k]   # (K, D) — already L2-normalised
+            neg_embs = all_embs[k:]   # (K, D)
+
+            # Mean-pool in embedding space → average axis anchor vector,
+            # then re-normalise so the anchor remains a unit vector.
+            pos_anchor = pos_embs.mean(axis=0)
+            pos_anchor /= max(np.linalg.norm(pos_anchor), 1e-8)
+            neg_anchor = neg_embs.mean(axis=0)
+            neg_anchor /= max(np.linalg.norm(neg_anchor), 1e-8)
+
+            # Ensemble mean score
+            mean_axis_score = np.clip(
+                frame_embeddings @ pos_anchor - frame_embeddings @ neg_anchor,
+                -2.0, 2.0,
+            ).astype(np.float32)
+
+            # Per-prompt-pair scores → std as confidence proxy
+            pair_scores = np.zeros((k, n), dtype=np.float32)
+            for pi in range(k):
+                p = pos_embs[pi]
+                q = neg_embs[pi]
+                pair_scores[pi] = np.clip(
+                    frame_embeddings @ p - frame_embeddings @ q, -2.0, 2.0
+                )
+            axis_confidence = pair_scores.std(axis=0).astype(np.float32)
+
+            mean_scores[axis_name] = mean_axis_score
+            confidence_scores[axis_name] = axis_confidence
+
+            logger.debug(
+                "Ensemble axis '%s': mean=%.4f, mean_confidence=%.4f.",
+                axis_name,
+                float(mean_axis_score.mean()),
+                float(axis_confidence.mean()),
+            )
+
+        logger.info(
+            "Ensemble affective scores computed for %d frames, %d axes, "
+            "using %d prompts per pole.",
+            n, len(axes_def), k,
+        )
+        return mean_scores, confidence_scores
 
     def score_video_level(
         self,

@@ -144,6 +144,9 @@ def compute_inter_video_stats(
     Summarise mean and median pairwise similarities, overall and split by
     *within-video* vs *cross-video* frame pairs.
 
+    Uses vectorised NumPy boolean indexing over the upper triangle of the
+    similarity matrix — no Python loop over frame pairs.
+
     Args:
         similarity_matrix: ``(N, N)`` cosine-similarity matrix.
         index:             Metadata list aligned with rows.
@@ -158,23 +161,23 @@ def compute_inter_video_stats(
     n = similarity_matrix.shape[0]
     video_ids = np.array([entry.get("video_id", "") for entry in index])
 
-    within_vals: List[float] = []
-    cross_vals: List[float] = []
+    # Upper-triangle mask (excludes diagonal and lower triangle)
+    upper = np.triu(np.ones((n, n), dtype=bool), k=1)
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            val = float(similarity_matrix[i, j])
-            if video_ids[i] == video_ids[j]:
-                within_vals.append(val)
-            else:
-                cross_vals.append(val)
+    # Within-video pairs: same video_id in the upper triangle
+    same_video = video_ids[:, None] == video_ids[None, :]  # (N, N) bool
+    within_mask = same_video & upper
+    cross_mask = (~same_video) & upper
 
-    all_vals = within_vals + cross_vals
+    within_vals = similarity_matrix[within_mask]
+    cross_vals = similarity_matrix[cross_mask]
+    all_vals = similarity_matrix[upper]
+
     stats = {
-        "overall_mean": float(np.mean(all_vals)) if all_vals else float("nan"),
-        "overall_median": float(np.median(all_vals)) if all_vals else float("nan"),
-        "within_video_mean": float(np.mean(within_vals)) if within_vals else float("nan"),
-        "cross_video_mean": float(np.mean(cross_vals)) if cross_vals else float("nan"),
+        "overall_mean": float(np.mean(all_vals)) if all_vals.size else float("nan"),
+        "overall_median": float(np.median(all_vals)) if all_vals.size else float("nan"),
+        "within_video_mean": float(np.mean(within_vals)) if within_vals.size else float("nan"),
+        "cross_video_mean": float(np.mean(cross_vals)) if cross_vals.size else float("nan"),
     }
     logger.info("Inter-video similarity stats: %s", stats)
     return stats

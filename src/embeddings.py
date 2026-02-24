@@ -254,16 +254,25 @@ def compute_and_save_embeddings(
     Returns:
         ``(embeddings, index)`` – also written to disk.
     """
-    image_paths = [entry["file_path"] for entry in metadata]
+    # Only pass files that actually exist; build the index from this filtered
+    # list so that embedding row i always corresponds to index[i].  Using the
+    # full `metadata` for enumerate() while filtering by existence would
+    # produce an index whose embedding_idx values skip integers whenever an
+    # image is missing, silently misaligning every downstream lookup.
+    valid_metadata = [e for e in metadata if os.path.exists(e["file_path"])]
+    skipped = len(metadata) - len(valid_metadata)
+    if skipped:
+        logger.warning(
+            "%d / %d frame files not found and will be skipped.",
+            skipped, len(metadata),
+        )
+
+    image_paths = [e["file_path"] for e in valid_metadata]
     model = EmbeddingModel(model_name=model_name, batch_size=batch_size)
     embeddings = model.embed_images(image_paths)
 
-    # Build index keeping all metadata fields
-    index = [
-        {**entry, "embedding_idx": i}
-        for i, entry in enumerate(metadata)
-        if os.path.exists(entry["file_path"])
-    ]
+    # embedding row i ↔ valid_metadata[i] — indices are contiguous
+    index = [{**entry, "embedding_idx": i} for i, entry in enumerate(valid_metadata)]
 
     save_embeddings(embeddings, index, output_dir, tag=tag)
     return embeddings, index
