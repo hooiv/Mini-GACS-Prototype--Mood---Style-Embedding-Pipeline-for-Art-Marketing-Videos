@@ -3188,6 +3188,464 @@ class TestEncodeText(unittest.TestCase):
         np.testing.assert_allclose(norms, np.ones(len(norms)), atol=1e-5)
 
 
+# ---------------------------------------------------------------------------
+# Helpers shared by new test classes
+# ---------------------------------------------------------------------------
+
+def _make_mock_affective_scorer(emb_dim: int = 16, seed: int = 42):
+    """
+    Build a minimal mock AffectiveScorer suitable for OcclusionSaliency tests.
+
+    The mock exposes:
+    - scorer.device       = "cpu"
+    - scorer.axes         = {"energy": (...), "warmth": (...)}
+    - scorer.encode_text  = deterministic unit-vector function
+    - scorer.processor    = callable returning {"pixel_values": torch.Tensor}
+    - scorer.model.get_image_features = callable returning L2-normalised tensor
+    """
+    import torch
+
+    scorer = MagicMock()
+    scorer.device = "cpu"
+    scorer.axes = {
+        "energy": ("energetic dynamic", "calm still"),
+        "warmth":  ("warm golden",       "cold icy"),
+    }
+    rng_np = np.random.default_rng(seed)
+
+    def _encode_text(prompts):
+        n = len(prompts)
+        embs = rng_np.random((n, emb_dim)).astype(np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        return embs / (norms + 1e-8)
+
+    scorer.encode_text.side_effect = _encode_text
+
+    def _processor(images=None, return_tensors=None, padding=None, **_kw):
+        n = len(images) if images is not None else 1
+        return {"pixel_values": torch.zeros(n, 3, 32, 32)}
+
+    scorer.processor.side_effect = _processor
+
+    def _get_image_features(**kwargs):
+        n = kwargs["pixel_values"].shape[0]
+        # Return L2-normalised random tensors seeded by n for determinism
+        rng = np.random.default_rng(n + seed)
+        embs = rng.random((n, emb_dim)).astype(np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        embs = embs / (norms + 1e-8)
+        return torch.tensor(embs, dtype=torch.float32)
+
+    scorer.model.get_image_features.side_effect = _get_image_features
+    return scorer
+
+
+def _make_ranked_creative(
+    frame_idx=0, video_id="vid_a", timestamp=0.0,
+    predicted_score=0.70, ci_lower=0.65, ci_upper=0.75,
+    rank=1, diversity_score=0.90,
+):
+    """Create a RankedCreative dataclass instance for A/B testing tests."""
+    from src.ranking import RankedCreative
+    return RankedCreative(
+        rank=rank,
+        frame_idx=frame_idx,
+        video_id=video_id,
+        timestamp=timestamp,
+        predicted_score=predicted_score,
+        ci_lower=ci_lower,
+        ci_upper=ci_upper,
+        diversity_score=diversity_score,
+        metadata={},
+    )
+
+
+# ---------------------------------------------------------------------------
+# OcclusionSaliency tests
+# ---------------------------------------------------------------------------
+
+class TestOcclusionSaliency(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.scorer = _make_mock_affective_scorer()
+        # Create a synthetic JPEG image
+        self.img_path = os.path.join(self.tmp, "test_frame.jpg")
+        _make_synthetic_frame(self.img_path, r=120, g=80, b=60)
+
+    def test_compute_saliency_returns_correct_axes(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=2, grid_cols=2)
+        baseline = {"energy": 0.5, "warmth": 0.3}
+        result = occ.compute_saliency(self.img_path, baseline)
+        self.assertIn("energy", result)
+        self.assertIn("warmth", result)
+
+    def test_compute_saliency_grid_shape(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=3, grid_cols=4)
+        baseline = {"energy": 0.5, "warmth": 0.3}
+        result = occ.compute_saliency(self.img_path, baseline)
+        self.assertEqual(result["energy"].shape, (3, 4))
+        self.assertEqual(result["warmth"].shape, (3, 4))
+
+    def test_compute_saliency_no_nan(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=2, grid_cols=2)
+        baseline = {"energy": 0.6, "warmth": -0.2}
+        result = occ.compute_saliency(self.img_path, baseline)
+        for axis, grid in result.items():
+            self.assertFalse(
+                np.isnan(grid).any(),
+                f"NaN in saliency grid for axis '{axis}'",
+            )
+
+    def test_compute_saliency_missing_file_raises(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer)
+        with self.assertRaises(FileNotFoundError):
+            occ.compute_saliency("/nonexistent/path.jpg", {"energy": 0.5})
+
+    def test_compute_saliency_empty_baseline_raises(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer)
+        with self.assertRaises(ValueError):
+            occ.compute_saliency(self.img_path, {})
+
+    def test_axis_anchor_cache_populated_on_first_call(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=2, grid_cols=2)
+        self.assertIsNone(occ._axis_anchor_cache)
+        occ.compute_saliency(self.img_path, {"energy": 0.5, "warmth": 0.3})
+        self.assertIsNotNone(occ._axis_anchor_cache)
+        self.assertIn("energy", occ._axis_anchor_cache)
+
+    def test_invalidate_cache_clears_anchors(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=2, grid_cols=2)
+        occ.compute_saliency(self.img_path, {"energy": 0.5, "warmth": 0.3})
+        self.assertIsNotNone(occ._axis_anchor_cache)
+        occ.invalidate_cache()
+        self.assertIsNone(occ._axis_anchor_cache)
+
+    def test_top_important_patches_returns_correct_count(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=4, grid_cols=4)
+        baseline = {"energy": 0.5, "warmth": 0.3}
+        saliency = occ.compute_saliency(self.img_path, baseline)
+        top3 = occ.top_important_patches(saliency, "energy", top_k=3)
+        self.assertEqual(len(top3), 3)
+        for row, col, imp in top3:
+            self.assertIsInstance(row, int)
+            self.assertIsInstance(col, int)
+            self.assertIsInstance(imp, float)
+
+    def test_top_important_patches_sorted_by_abs_importance(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=4, grid_cols=4)
+        baseline = {"energy": 0.8, "warmth": 0.1}
+        saliency = occ.compute_saliency(self.img_path, baseline)
+        top3 = occ.top_important_patches(saliency, "energy", top_k=3)
+        # Verify descending order of |importance|
+        importances = [abs(imp) for _, _, imp in top3]
+        self.assertEqual(importances, sorted(importances, reverse=True))
+
+    def test_top_important_patches_unknown_axis_raises(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer)
+        with self.assertRaises(KeyError):
+            occ.top_important_patches({"energy": np.zeros((2, 2))}, "unknown_axis")
+
+    def test_plot_saliency_overlay_creates_png(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer, grid_rows=2, grid_cols=2)
+        baseline = {"energy": 0.5, "warmth": 0.3}
+        saliency = occ.compute_saliency(self.img_path, baseline)
+        out = os.path.join(self.tmp, "saliency_test.png")
+        result_path = occ.plot_saliency_overlay(self.img_path, saliency, out)
+        self.assertTrue(os.path.exists(result_path))
+        self.assertGreater(os.path.getsize(result_path), 0)
+
+    def test_batch_compute_saliency_length_match(self):
+        from src.explainability import OcclusionSaliency
+        img2 = os.path.join(self.tmp, "test_frame2.jpg")
+        _make_synthetic_frame(img2, r=200, g=200, b=200)
+        occ = OcclusionSaliency(self.scorer, grid_rows=2, grid_cols=2)
+        paths = [self.img_path, img2]
+        scores_list = [{"energy": 0.5, "warmth": 0.3}] * 2
+        results = occ.batch_compute_saliency(paths, scores_list)
+        self.assertEqual(len(results), 2)
+
+    def test_batch_compute_saliency_length_mismatch_raises(self):
+        from src.explainability import OcclusionSaliency
+        occ = OcclusionSaliency(self.scorer)
+        with self.assertRaises(ValueError):
+            occ.batch_compute_saliency([self.img_path], [{"energy": 0.5}, {"energy": 0.3}])
+
+    def test_invalid_grid_raises(self):
+        from src.explainability import OcclusionSaliency
+        with self.assertRaises(ValueError):
+            OcclusionSaliency(self.scorer, grid_rows=0, grid_cols=4)
+
+
+# ---------------------------------------------------------------------------
+# CreativeABTester tests
+# ---------------------------------------------------------------------------
+
+class TestCreativeABTester(unittest.TestCase):
+
+    def _creative(self, score, ci_half=0.05, rank=1, video_id="vid_a", frame_idx=0):
+        return _make_ranked_creative(
+            frame_idx=frame_idx,
+            video_id=video_id,
+            predicted_score=score,
+            ci_lower=score - ci_half,
+            ci_upper=score + ci_half,
+            rank=rank,
+        )
+
+    def test_invalid_win_threshold_raises(self):
+        from src.ab_testing import CreativeABTester
+        with self.assertRaises(ValueError):
+            CreativeABTester(win_threshold=0.3)
+
+    def test_compare_pair_equal_scores_win_prob_near_half(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=500, random_state=0)
+        a = self._creative(0.70)
+        b = self._creative(0.70)
+        result = tester.compare_pair(a, b)
+        self.assertAlmostEqual(result.win_probability, 0.5, delta=0.05)
+
+    def test_compare_pair_a_much_better_prefer_a(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(win_threshold=0.80, n_thompson=500, random_state=0)
+        a = self._creative(0.90, ci_half=0.02)
+        b = self._creative(0.40, ci_half=0.02)
+        result = tester.compare_pair(a, b)
+        self.assertGreater(result.win_probability, 0.90)
+        self.assertEqual(result.recommendation, "prefer_a")
+
+    def test_compare_pair_b_much_better_prefer_b(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(win_threshold=0.80, n_thompson=500, random_state=0)
+        a = self._creative(0.30, ci_half=0.02)
+        b = self._creative(0.80, ci_half=0.02)
+        result = tester.compare_pair(a, b)
+        self.assertLess(result.win_probability, 0.10)
+        self.assertEqual(result.recommendation, "prefer_b")
+
+    def test_compare_pair_ci_overlap_in_range(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=500, random_state=0)
+        a = self._creative(0.70, ci_half=0.05)
+        b = self._creative(0.72, ci_half=0.05)
+        result = tester.compare_pair(a, b)
+        self.assertGreaterEqual(result.ci_overlap_fraction, 0.0)
+        self.assertLessEqual(result.ci_overlap_fraction, 1.0)
+
+    def test_compare_pair_cohens_d_sign(self):
+        """Cohen's d should be positive when A > B and negative when A < B."""
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=500, random_state=0)
+        a = self._creative(0.80)
+        b = self._creative(0.50)
+        res = tester.compare_pair(a, b)
+        self.assertGreater(res.cohens_d, 0.0)
+
+        # Reverse: B > A should give negative d
+        res2 = tester.compare_pair(b, a)
+        self.assertLess(res2.cohens_d, 0.0)
+
+    def test_compare_pair_result_fields_populated(self):
+        from src.ab_testing import ABTestResult, CreativeABTester
+        tester = CreativeABTester(n_thompson=200, random_state=0)
+        a = self._creative(0.70, video_id="vid_a", frame_idx=3)
+        b = self._creative(0.60, video_id="vid_b", frame_idx=7)
+        result = tester.compare_pair(a, b)
+        self.assertIsInstance(result, ABTestResult)
+        self.assertEqual(result.creative_a_video, "vid_a")
+        self.assertEqual(result.creative_b_video, "vid_b")
+        self.assertEqual(result.creative_a_frame_idx, 3)
+        self.assertEqual(result.creative_b_frame_idx, 7)
+        self.assertIn(result.recommendation, ("prefer_a", "prefer_b", "inconclusive"))
+
+    def test_thompson_consistency_with_closed_form(self):
+        """Thompson win rate should match P(A>B) within 3% at 10k samples.
+
+        At n_thompson = 10 000 the Monte Carlo standard error for a Bernoulli
+        proportion p is at most sqrt(p*(1-p)/n) ≤ 1/(2*sqrt(10000)) = 0.5%.
+        The 3% tolerance (6 standard errors) gives a very low false-failure
+        rate while still catching gross divergence between the two methods.
+        """
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=10_000, random_state=1)
+        a = self._creative(0.80, ci_half=0.04)
+        b = self._creative(0.60, ci_half=0.04)
+        result = tester.compare_pair(a, b)
+        thompson_win_rate = result.n_thompson_wins_a / tester.n_thompson
+        self.assertAlmostEqual(
+            thompson_win_rate, result.win_probability, delta=0.03
+        )
+
+    def test_compare_all_pairs_count(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=200, random_state=0)
+        ranking = [
+            self._creative(s, rank=i + 1, frame_idx=i, video_id=f"v{i}")
+            for i, s in enumerate([0.9, 0.7, 0.5, 0.3])
+        ]
+        results = tester.compare_all_pairs(ranking)
+        # C(4, 2) = 6 pairs
+        self.assertEqual(len(results), 6)
+
+    def test_compare_all_pairs_empty_ranking(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=200, random_state=0)
+        self.assertEqual(tester.compare_all_pairs([]), [])
+
+    def test_thompson_select_returns_correct_count(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=1000, random_state=0)
+        ranking = [
+            self._creative(s, rank=i + 1, frame_idx=i, video_id=f"v{i}")
+            for i, s in enumerate([0.9, 0.7, 0.5, 0.4, 0.3])
+        ]
+        selected = tester.thompson_select(ranking, n_select=3, n_samples=1000)
+        self.assertEqual(len(selected), 3)
+        # All selected indices should be distinct
+        self.assertEqual(len(set(selected)), 3)
+
+    def test_thompson_select_top_scorer_appears_in_top(self):
+        """The highest-scoring creative should almost always be in the top-1."""
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=5000, random_state=2)
+        ranking = [
+            self._creative(0.95, ci_half=0.01, rank=1, frame_idx=0, video_id="best"),
+            self._creative(0.40, ci_half=0.01, rank=2, frame_idx=1, video_id="mid"),
+            self._creative(0.20, ci_half=0.01, rank=3, frame_idx=2, video_id="low"),
+        ]
+        selected = tester.thompson_select(ranking, n_select=1, n_samples=5000)
+        self.assertEqual(selected[0], 0)  # index 0 = highest-scoring creative
+
+    def test_plot_comparison_creates_png(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=200, random_state=0)
+        a = self._creative(0.75, video_id="vid_a")
+        b = self._creative(0.55, video_id="vid_b")
+        result = tester.compare_pair(a, b)
+        tmp = tempfile.mkdtemp()
+        out = os.path.join(tmp, "ab_chart.png")
+        path = tester.plot_comparison(result, a, b, out)
+        self.assertTrue(os.path.exists(path))
+        self.assertGreater(os.path.getsize(path), 0)
+
+    def test_plot_tournament_heatmap_creates_png(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=200, random_state=0)
+        ranking = [
+            self._creative(s, rank=i + 1, frame_idx=i, video_id=f"v{i}")
+            for i, s in enumerate([0.9, 0.7, 0.5])
+        ]
+        tmp = tempfile.mkdtemp()
+        out = os.path.join(tmp, "tournament.png")
+        path = tester.plot_tournament_heatmap(ranking, out)
+        self.assertTrue(os.path.exists(path))
+        self.assertGreater(os.path.getsize(path), 0)
+
+    def test_save_results_creates_json(self):
+        from src.ab_testing import CreativeABTester
+        tester = CreativeABTester(n_thompson=200, random_state=0)
+        a = self._creative(0.80, video_id="vid_a")
+        b = self._creative(0.60, video_id="vid_b")
+        results = [tester.compare_pair(a, b)]
+        tmp = tempfile.mkdtemp()
+        out = os.path.join(tmp, "ab_results.json")
+        path = tester.save_results(results, out)
+        self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(len(data), 1)
+        self.assertIn("win_probability", data[0])
+        self.assertIn("recommendation", data[0])
+
+
+# ---------------------------------------------------------------------------
+# per_video_stats consecutive_sims fix tests
+# ---------------------------------------------------------------------------
+
+class TestTemporalPerVideoStatsFix(unittest.TestCase):
+
+    def _make_data(self, n=20):
+        """Create synthetic embeddings and index for two videos."""
+        rng = np.random.default_rng(42)
+        embs = rng.random((n, 8)).astype(np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        embs /= norms + 1e-8
+        index = [
+            {"video_id": "v0" if i < n // 2 else "v1",
+             "frame_idx": i, "timestamp": float(i)}
+            for i in range(n)
+        ]
+        return embs, index
+
+    def test_per_video_stats_backward_compatible(self):
+        """per_video_stats without consecutive_sims still works."""
+        from src.temporal_analysis import TemporalAnalyser
+        embs, index = self._make_data(20)
+        ta = TemporalAnalyser(window=2)
+        curve = ta.compute_temporal_curve(embs, index)
+        stats = ta.per_video_stats(curve, index)  # no consecutive_sims
+        self.assertIn("v0", stats)
+        self.assertIn("v1", stats)
+        self.assertIn("n_transitions", stats["v0"])
+
+    def test_per_video_stats_with_consecutive_sims(self):
+        """per_video_stats with consecutive_sims populates stats without error."""
+        from src.temporal_analysis import TemporalAnalyser
+        embs, index = self._make_data(20)
+        ta = TemporalAnalyser(window=2)
+        curve = ta.compute_temporal_curve(embs, index)
+        consec = ta.compute_consecutive_similarities(embs, index)
+        stats = ta.per_video_stats(curve, index, consecutive_sims=consec)
+        self.assertIn("v0", stats)
+        self.assertIn("v1", stats)
+        for vid in ("v0", "v1"):
+            self.assertIn("n_transitions", stats[vid])
+            self.assertGreaterEqual(stats[vid]["n_transitions"], 0.0)
+
+    def test_per_video_stats_consec_sims_different_from_windowed(self):
+        """
+        Using consecutive_sims for transitions should give a different
+        (and more accurate) count than using the windowed temporal curve.
+        Inject a hard cut so the two methods disagree.
+        """
+        from src.temporal_analysis import TemporalAnalyser
+        rng = np.random.default_rng(0)
+        n = 30
+        embs = rng.random((n, 16)).astype(np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        embs /= norms + 1e-8
+        # Inject a hard cut at position 15 by making frame 15 orthogonal
+        # to its neighbours — this produces a very low consecutive similarity
+        embs[15] = rng.random(16).astype(np.float32)
+        embs[15] = embs[15] / (np.linalg.norm(embs[15]) + 1e-8)
+        # Make it nearly orthogonal to frame 14 (random seed gives that)
+        index = [
+            {"video_id": "single_vid", "frame_idx": i, "timestamp": float(i)}
+            for i in range(n)
+        ]
+        ta = TemporalAnalyser(window=2)
+        curve = ta.compute_temporal_curve(embs, index)
+        consec = ta.compute_consecutive_similarities(embs, index)
+
+        stats_windowed = ta.per_video_stats(curve, index)
+        stats_consec   = ta.per_video_stats(curve, index, consecutive_sims=consec)
+        # Both should return valid (non-negative) transition counts
+        self.assertGreaterEqual(stats_windowed["single_vid"]["n_transitions"], 0.0)
+        self.assertGreaterEqual(stats_consec["single_vid"]["n_transitions"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

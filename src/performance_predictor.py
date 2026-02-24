@@ -546,7 +546,7 @@ class VibePerformancePredictor:
         from matplotlib.patches import Patch
         legend_elements = [
             Patch(facecolor="#e07b54", label="Affective axis"),
-            Patch(facecolor="#5486e0", label="PCA dimension"),
+            Patch(facecolor="#5486e0", label="Other feature"),
         ]
         ax.legend(handles=legend_elements, fontsize=8, loc="lower right")
         ax.grid(axis="x", linestyle=":", alpha=0.4)

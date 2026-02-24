@@ -34,9 +34,11 @@ A self-contained Python pipeline that:
 │   ├── ranking.py                # Diversity-constrained MMR creative ranking with bootstrap CI
 │   ├── calibration.py            # Post-hoc Platt/isotonic predictor calibration + ECE
 │   ├── text_query.py             # Text-guided creative retrieval (CLIP text-to-image search)
-│   └── drift_detector.py         # Embedding distribution drift monitoring (MMD + KS + IF)
+│   ├── drift_detector.py         # Embedding distribution drift monitoring (MMD + KS + IF)
+│   ├── explainability.py         # Occlusion saliency: spatial importance maps for affective scores
+│   └── ab_testing.py             # Bayesian A/B testing: P(A>B), Thompson sampling, tournament
 ├── tests/
-│   └── test_pipeline.py     # Unit + integration tests (pytest, 184 tests)
+│   └── test_pipeline.py     # Unit + integration tests (pytest, 216 tests)
 ├── data/
 │   ├── videos/              # Source videos (downloaded or user-provided)
 │   ├── frames/              # Extracted frame images (auto-generated)
@@ -47,7 +49,7 @@ A self-contained Python pipeline that:
 ├── pytest.ini               # Pytest discovery configuration
 ├── notebook.ipynb           # Interactive Jupyter walkthrough (all steps)
 ├── download_videos.py       # Helper: download 3 sample CC0 videos
-├── main.py                  # End-to-end pipeline orchestrator (14 steps)
+├── main.py                  # End-to-end pipeline orchestrator (16 steps)
 ├── requirements.txt
 ├── README.md                # This file
 └── REPORT.md                # GenTA / GACS design discussion

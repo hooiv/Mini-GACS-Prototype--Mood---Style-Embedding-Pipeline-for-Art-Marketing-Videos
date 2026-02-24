@@ -24,6 +24,8 @@ Steps
 11c. Rank creatives — diversity-constrained MMR ranking with 95% CI.
 12b. Text-guided creative retrieval — rank frames and videos by brand brief.
 13. Embedding distribution drift detection — MMD + KS test + anomaly fraction.
+15. Bayesian A/B testing on top-ranked creatives — P(A>B), Thompson sampling.
+16. Occlusion saliency — spatial importance maps for affective axis scores.
 14. Write structured run manifest (run_manifest.json).
 
 Usage
@@ -94,6 +96,8 @@ from src.ranking import CreativeRanker
 from src.calibration import PredictorCalibrator
 from src.text_query import TextQueryRetriever
 from src.drift_detector import EmbeddingDriftDetector
+from src.ab_testing import CreativeABTester
+from src.explainability import OcclusionSaliency
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -223,6 +227,12 @@ def main() -> None:
     # --skip-embedding is used both remain None and the retriever lazy-loads.
     clip_model = None
     clip_processor = None
+
+    # Step-result references: initialised to None so Steps 15 and 16 can
+    # check availability without using fragile dir() introspection.
+    ranked = None            # Set in Step 11c if creative ranking succeeds
+    frame_scores = None      # Set in Step 8 if affective scoring succeeds
+    affective_scorer = None  # Set in Step 8 if affective scoring succeeds
 
     # -----------------------------------------------------------------------
     # Step 1 – Download sample videos
@@ -570,6 +580,7 @@ def main() -> None:
 
         # Update frame_scores to use ensemble for downstream modules
         frame_scores = ens_scores
+        affective_scorer = scorer  # expose for Step 16 (occlusion saliency)
 
     except (RuntimeError, ValueError, OSError, ImportError) as exc:
         logger.warning("Affective scoring step failed (%s); continuing.", exc)
@@ -1010,6 +1021,157 @@ def main() -> None:
 
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("Drift detection step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 15 – Bayesian A/B testing on the top-ranked creatives
+    #
+    # Pure ranking by point estimate doesn't answer "are we statistically
+    # confident that creative #1 outperforms creative #2?"  CreativeABTester
+    # computes P(A > B) under the Gaussian CI model from CreativeRanker and
+    # validates it with Thompson sampling.  The tournament heatmap gives a
+    # holistic view of pairwise dominance across the whole top-k set.
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 15: Bayesian A/B testing on top-ranked creatives ===")
+    print("\n── Step 15: Bayesian A/B Testing ──")
+    try:
+        # `ranked` is initialised to None at the start of main(); it is
+        # populated by Step 11c when creative ranking succeeds.
+        if ranked is not None and len(ranked) >= 2:
+            ab_tester = CreativeABTester(win_threshold=0.80, n_thompson=10_000)
+
+            # Pairwise test: #1 vs #2 (most actionable comparison)
+            ab_result = ab_tester.compare_pair(ranked[0], ranked[1])
+            print(
+                f"  #{ranked[0].rank} vs #{ranked[1].rank}: "
+                f"P(A>B)={ab_result.win_probability:.3f}  "
+                f"d={ab_result.cohens_d:+.2f}  "
+                f"→ {ab_result.recommendation}"
+            )
+
+            ab_chart = ab_tester.plot_comparison(
+                ab_result, ranked[0], ranked[1],
+                output_path=os.path.join(OUTPUTS_DIR, "ab_comparison.png"),
+                title="Bayesian A/B: #1 vs #2 Creative",
+            )
+            print(f"  A/B chart:         {ab_chart}")
+
+            # All-pairs comparison for top-5 creatives
+            top5 = ranked[:min(5, len(ranked))]
+            all_ab = ab_tester.compare_all_pairs(top5)
+
+            decisive = [r for r in all_ab if r.recommendation != "inconclusive"]
+            print(
+                f"  All-pairs (top-5): {len(all_ab)} comparisons, "
+                f"{len(decisive)} decisive (P > 0.80 or < 0.20)"
+            )
+
+            ab_json = ab_tester.save_results(
+                all_ab,
+                output_path=os.path.join(OUTPUTS_DIR, "ab_results.json"),
+            )
+            print(f"  A/B JSON:          {ab_json}")
+
+            tournament = ab_tester.plot_tournament_heatmap(
+                top5,
+                output_path=os.path.join(OUTPUTS_DIR, "ab_tournament.png"),
+                title="P(row > col) — Top-5 Creative Tournament",
+            )
+            print(f"  Tournament:        {tournament}")
+
+            # Thompson sampling: select top-3 from top-5 by win rate
+            thompson_top3 = ab_tester.thompson_select(top5, n_select=3)
+            print(
+                f"  Thompson top-3 (from top-5): "
+                + str([f"#{top5[i].rank}" for i in thompson_top3])
+            )
+
+            manifest.record(
+                "ab_testing",
+                n_pairs=len(all_ab),
+                n_decisive=len(decisive),
+                top1_vs_top2_win_prob=round(ab_result.win_probability, 4),
+                recommendation=ab_result.recommendation,
+                thompson_top3=[int(top5[i].rank) for i in thompson_top3],
+            )
+            manifest.add_artifact(tournament, "A/B tournament heatmap")
+        else:
+            print("  Skipped: no ranked creatives available (Step 11c did not run).")
+
+    except (RuntimeError, ValueError, OSError, NameError) as exc:
+        logger.warning("A/B testing step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 16 – Occlusion saliency for representative frames
+    #
+    # For each query frame from Step 5, compute which spatial regions of the
+    # image most contributed to each affective axis score.  This turns the
+    # black-box "energy = 0.72" into an interpretable spatial map — a
+    # prerequisite for actionable creative recommendations ("the top-left
+    # product shot is what drives your luxury score").
+    #
+    # Only runs when affective scores are available AND frame files exist on
+    # disk (not available in --skip-extraction mode on CI).
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 16: Occlusion saliency for representative frames ===")
+    print("\n── Step 16: Occlusion Saliency ──")
+    try:
+        # frame_scores and affective_scorer are initialised to None at the
+        # start of main(); both are set by Step 8 when affective scoring
+        # succeeds.
+        if (
+            frame_scores is not None
+            and len(frame_scores) > 0
+            and affective_scorer is not None
+            and len(index) > 0
+        ):
+            occ = OcclusionSaliency(affective_scorer, grid_rows=4, grid_cols=4)
+
+            # Pick up to 3 query frames that have image files on disk
+            saliency_frames = [
+                (i, e) for i, e in enumerate(index)
+                if os.path.exists(e.get("file_path", ""))
+            ][:3]
+
+            if saliency_frames:
+                for global_idx, meta in saliency_frames:
+                    baseline = {
+                        ax: float(frame_scores[ax][global_idx])
+                        for ax in frame_scores
+                        if global_idx < len(frame_scores[ax])
+                    }
+                    saliency = occ.compute_saliency(
+                        meta["file_path"], baseline
+                    )
+                    out_name = (
+                        f"saliency_{meta.get('video_id','v')}"
+                        f"_f{meta.get('frame_idx', global_idx)}.png"
+                    )
+                    sal_path = occ.plot_saliency_overlay(
+                        meta["file_path"], saliency,
+                        output_path=os.path.join(OUTPUTS_DIR, out_name),
+                    )
+                    # Show top-3 patches for the energy axis as example
+                    if "energy" in saliency:
+                        top3 = occ.top_important_patches(saliency, "energy", top_k=3)
+                        print(
+                            f"  {meta.get('video_id')} frame {meta.get('frame_idx')}: "
+                            f"top energy patches (row,col,imp): "
+                            + str([(r, c, round(imp, 3)) for r, c, imp in top3])
+                        )
+                    print(f"  Saliency overlay:  {sal_path}")
+                    manifest.add_artifact(sal_path, f"Occlusion saliency: {out_name}")
+
+                manifest.record("occlusion_saliency", n_frames=len(saliency_frames))
+            else:
+                print("  Skipped: no frame files found on disk.")
+        else:
+            print(
+                "  Skipped: affective scores or scorer not available "
+                "(run without --skip-embedding)."
+            )
+
+    except (RuntimeError, ValueError, OSError, NameError) as exc:
+        logger.warning("Occlusion saliency step failed (%s); continuing.", exc)
 
     # -----------------------------------------------------------------------
     # Step 14 – Save run manifest

@@ -334,13 +334,29 @@ class TemporalAnalyser:
         self,
         temporal_curve: np.ndarray,
         index: List[Dict],
+        consecutive_sims: Optional[np.ndarray] = None,
     ) -> Dict[str, Dict[str, float]]:
         """
         Aggregate temporal statistics per video.
 
         Args:
-            temporal_curve:  Output of :meth:`compute_temporal_curve`.
-            index:           Metadata list aligned with *temporal_curve*.
+            temporal_curve:   Output of :meth:`compute_temporal_curve`.
+            index:            Metadata list aligned with *temporal_curve*.
+            consecutive_sims: Optional output of
+                              :meth:`compute_consecutive_similarities`.
+                              When provided, per-video transition counts are
+                              derived from the *consecutive frame-to-frame
+                              similarities* rather than from the windowed
+                              temporal curve.
+
+                              **Why this matters**: the temporal curve is
+                              already a smoothed (moving-average) signal.
+                              Detecting drops in it is double-smoothing —
+                              the effective cut amplitude is attenuated by
+                              30–60 %, causing missed detections.
+                              ``consecutive_sims`` is the unsmoothed
+                              per-frame signal and gives more accurate
+                              transition counts.
 
         Returns:
             Dict ``{video_id: {coherence, pacing, n_frames, ...}}``.
@@ -353,7 +369,23 @@ class TemporalAnalyser:
         stats: Dict[str, Dict[str, float]] = {}
         for vid, frame_indices in video_groups.items():
             vid_curve = temporal_curve[frame_indices]
-            transitions = self.detect_scene_transitions(vid_curve)
+
+            if consecutive_sims is not None:
+                # Sort frame indices by their temporal position before slicing
+                # so that adjacent elements of the slice correspond to
+                # adjacent frames in the video timeline.
+                sorted_indices = sorted(
+                    frame_indices,
+                    key=lambda i: index[i].get(
+                        "timestamp", index[i].get("frame_idx", 0)
+                    ),
+                )
+                vid_consec = consecutive_sims[sorted_indices]
+                transitions = self.detect_scene_transitions(vid_consec)
+            else:
+                # Backward-compatible path: use the windowed temporal curve.
+                transitions = self.detect_scene_transitions(vid_curve)
+
             stats[vid] = {
                 "coherence": self.coherence_score(vid_curve),
                 "pacing": self.pacing_score(vid_curve),

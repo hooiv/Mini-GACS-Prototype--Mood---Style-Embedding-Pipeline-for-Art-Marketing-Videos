@@ -730,3 +730,190 @@ a frame-level signal.
 *Verified by*: `TestEmbeddingDriftDetector` — 9 tests including same-data
 low-MMD, shifted-distribution higher-MMD, report field types, anomaly-fraction
 range, JSON/PNG persistence, and pre-fit error guard.
+
+---
+
+## 11. Spatial Explainability — Occlusion Saliency *(implemented — `src/explainability.py`)*
+
+### Gap
+
+All affective scoring until this point produces a single scalar per axis per frame
+(e.g., `energy = 0.72`) but gives no indication of *where* in the image that score
+originates.  This is the classic black-box problem in applied AI.  Creative teams
+cannot act on "this frame scores low on luxury" without knowing *which spatial
+region* is causing the low score.
+
+Without spatial feedback, the system cannot answer:
+
+- "Which part of the composition is suppressing the warmth score?"
+- "Is CLIP responding to the product, the background, or the lighting?"
+- "If I reframe the shot to exclude the cluttered foreground, will the
+  complexity score improve?"
+
+### Approach: Occlusion Saliency
+
+Occlusion saliency (Zeiler & Fergus 2014, "Visualizing and Understanding
+Convolutional Networks") measures causal patch importance by intervening on the
+input:
+
+```
+importance[i,j] = baseline_score[axis]
+                − occluded_score[axis, i, j]
+
+where occluded_score is computed with patch (i,j) replaced by mid-grey (128)
+```
+
+Interpretation:
+- `importance > 0` → the patch *raised* the axis score; removing it hurts.
+- `importance < 0` → the patch *suppressed* the axis score; removing it helps.
+- `importance ≈ 0` → the patch is irrelevant for this axis.
+
+### Why occlusion and not gradient-based saliency?
+
+CLIP uses a Vision Transformer (ViT-B/32).  Standard Grad-CAM requires gradients
+of the class score w.r.t. the final convolutional feature map — ViT has no such
+map.  Proper ViT saliency methods (GradCAM++, Attention Rollout) require accessing
+multi-layer activations via forward hooks, adding significant framework complexity
+and fragility.
+
+Occlusion saliency:
+- Is **gradient-free** — no `backward()` pass, no hooks, no autograd graph.
+- Measures a **causal** quantity (do-operator: "if I remove this patch, what happens?").
+- Costs exactly **one batched CLIP forward pass per frame** (all 16 patches in one call).
+- Produces **human-interpretable** spatial maps without requiring ML expertise to
+  understand.
+
+### Implementation details
+
+`OcclusionSaliency.__init__` takes a configured `AffectiveScorer` and a
+`grid_rows × grid_cols` specification (default 4×4 = 16 patches).
+
+**Axis anchor cache**: text embeddings for axis prompts are computed once and
+cached.  For 6 axes × 2 prompts = 12 text encoder calls per instance (not per
+image).  `invalidate_cache()` clears the cache if `scorer.axes` changes.
+
+**Batched patch encoding**: all 16 occluded images are stacked into a single GPU
+forward pass.  For ViT-B/32 this is ~20 ms on a modern GPU vs ~1 ms per individual
+image.
+
+**`batch_compute_saliency`**: processes multiple frames sequentially; each frame
+still benefits from the single-batch optimisation.
+
+**`top_important_patches`**: returns the top-k patches sorted by `|importance|`
+for an actionable "these are the three regions most responsible for this score"
+summary.
+
+**Plot overlay**: `plot_saliency_overlay` creates a multi-panel figure with the
+original image and one heatmap overlay per axis (nearest-neighbour upsampled from
+grid to full image resolution).  Green = score-boosting; red = score-suppressing.
+
+*Verified by*: `TestOcclusionSaliency` — 14 tests covering grid shapes, NaN checks,
+FileNotFoundError, empty-baseline error, cache population and invalidation,
+top-patches sorting, batch length mismatch, PNG output, and invalid grid construction.
+
+---
+
+## 12. Bayesian A/B Testing *(implemented — `src/ab_testing.py`)*
+
+### Gap
+
+`CreativeRanker` produces a ranked list with 95% CI per creative.  But the
+system still cannot answer the key production question: **"Is creative #1
+statistically better than creative #2?"**  Point estimates ignore uncertainty;
+CI overlap is hard to quantify visually.  For a creative approval workflow,
+practitioners need a single number and a recommendation.
+
+### Design
+
+**Closed-form Bayesian pairwise test** under the Gaussian CI model:
+
+```
+score_A ~ N(μ_A, σ_A)   where σ_A = (ci_upper_A − ci_lower_A) / (2 × 1.96)
+score_B ~ N(μ_B, σ_B)
+
+P(A > B) = Φ((μ_A − μ_B) / sqrt(σ_A² + σ_B²))
+```
+
+where Φ is the standard normal CDF.  This is exact (not approximate) under the
+Gaussian model, and is the same formula used in Bayesian bandit literature for
+online ad optimisation (Chapelle & Li 2011, NeurIPS).
+
+**Cohen's d effect size**:
+
+```
+d = (μ_A − μ_B) / sqrt((σ_A² + σ_B²) / 2)
+```
+
+|d| < 0.2 = negligible, 0.2–0.5 = small, 0.5–0.8 = medium, > 0.8 = large.
+
+**CI overlap fraction**: fraction of the shorter CI that overlaps with the other.
+0.0 = completely separate (decisive); 1.0 = fully nested (inconclusive).
+
+**Recommendation thresholds**: P(A > B) > 0.80 → "prefer_a"; < 0.20 → "prefer_b";
+otherwise → "inconclusive".  Conservative by design: we require 80% confidence
+before issuing a recommendation.
+
+### Thompson sampling
+
+For *n_samples* draws:
+1. Sample `s_i ~ N(μ_i, σ_i)` for each creative `i`.
+2. The creative with the highest sample wins that draw.
+
+Win rate = fraction of draws won.  For two creatives this equals P(A > B) to
+within 1% Monte Carlo error at 10 000 samples — an independent validation of the
+closed-form result.  For > 2 creatives, Thompson sampling selects the top-*n*
+by win rate in a single call, which is the natural multi-armed bandit allocation
+for the next campaign flight.
+
+### Outputs
+
+1. **`compare_pair`** → `ABTestResult` with all statistics.
+2. **`compare_all_pairs`** → all C(N,2) pairwise comparisons, sorted by decisiveness.
+3. **`thompson_select`** → top-*k* creatives by Thompson win rate.
+4. **`plot_comparison`** — two-panel figure: score distributions + Thompson bar chart.
+5. **`plot_tournament_heatmap`** — N×N matrix of P(row > col) for the full top-k set.
+6. **`save_results`** → JSON with all ABTestResult fields.
+
+*Verified by*: `TestCreativeABTester` — 15 tests covering equal-score ≈ 0.5,
+decisive-separation "prefer_a/b", Cohen's d sign, Thompson consistency with
+closed form (within 3% at 10k samples), all-pairs count, empty ranking,
+top-scorer Thompson selection, and PNG/JSON persistence.
+
+---
+
+## 13. Bug Fixes in Round 4
+
+### 13a. Dead legend entry in `plot_feature_importance` (`src/performance_predictor.py`)
+
+**Root cause**: The `plot_feature_importance` legend contained the entry
+`"PCA dimension"` (blue).  PCA features were removed from the feature matrix in
+the Round 2 leakage fix (`generate_synthetic_performance_data` §7c).  After that
+fix, all features are affective axes — every bar is orange — so the blue legend
+entry was dead code that actively *misinformed* users about the feature types.
+
+**Fix**: Changed `"PCA dimension"` → `"Other feature"` so the label is accurate
+for the general case (non-affective features in production) without being
+wrong for the current all-affective case.
+
+### 13b. `per_video_stats` used windowed curve for transition counts (`src/temporal_analysis.py`)
+
+**Root cause**: `per_video_stats()` called `detect_scene_transitions(vid_curve)`
+where `vid_curve` is the *windowed temporal curve* (a moving average of
+neighbourhood similarity).  This is a smoothed signal; detecting drops in it is
+double-smoothing.  As documented in §6b, the windowed curve attenuates hard-cut
+amplitude by 30–60%, causing `n_transitions` in the per-video stats to
+*undercount* actual cuts.
+
+Meanwhile, `main.py` correctly used `compute_consecutive_similarities` for
+transition detection — but `per_video_stats` was not updated.  This created an
+inconsistency: the top-level transition analysis used the correct signal while
+the per-video summary used the degraded one.
+
+**Fix**: Added an optional `consecutive_sims` parameter to `per_video_stats`.
+When provided, per-video transition counts are derived from the consecutive
+frame-to-frame similarities (sorted by timestamp) rather than the windowed curve.
+The function remains backward compatible: callers that don't pass `consecutive_sims`
+get the original behaviour.
+
+*Verified by*: `TestTemporalPerVideoStatsFix` — 3 tests confirming backward
+compatibility, correct operation with `consecutive_sims`, and non-negative counts.
