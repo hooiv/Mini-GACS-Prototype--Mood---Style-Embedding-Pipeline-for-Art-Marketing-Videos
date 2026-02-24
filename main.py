@@ -57,6 +57,7 @@ from src.visualization import (
     plot_top_k_grid,
     generate_similarity_report,
 )
+from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -265,6 +266,42 @@ def main() -> None:
         output_path=os.path.join(OUTPUTS_DIR, "similarity_report.md"),
     )
     print(f"\n  Report: {report_path}")
+
+    # -----------------------------------------------------------------------
+    # Step 8 – Affective scoring (text-guided zero-shot CLIP probing)
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 8: Compute affective axis scores ===")
+    try:
+        scorer = AffectiveScorer(model_name=args.model, axes=DEFAULT_AXES)
+        frame_scores = scorer.score_frames(embeddings, index)
+
+        print("\n── Affective axis scores (mean per axis) ──")
+        for axis_name, scores in frame_scores.items():
+            print(f"  {axis_name:12s}: {float(scores.mean()):+.4f}")
+        print()
+
+        video_scores = scorer.score_video_level(frame_scores, index)
+
+        affective_json = scorer.save_scores(
+            frame_scores, index,
+            output_path=os.path.join(OUTPUTS_DIR, "affective_scores.json"),
+        )
+        print(f"  Affective scores JSON: {affective_json}")
+
+        affective_heatmap = scorer.plot_heatmap(
+            frame_scores, index,
+            output_path=os.path.join(OUTPUTS_DIR, "affective_heatmap.png"),
+        )
+        print(f"  Affective heatmap:     {affective_heatmap}")
+
+        radar_path = scorer.plot_radar(
+            video_scores,
+            output_path=os.path.join(OUTPUTS_DIR, "affective_radar.png"),
+        )
+        print(f"  Affective radar:       {radar_path}")
+
+    except (RuntimeError, ValueError, OSError, ImportError) as exc:
+        logger.warning("Affective scoring step failed (%s); continuing.", exc)
 
     print("\n✓ Pipeline complete.")
 

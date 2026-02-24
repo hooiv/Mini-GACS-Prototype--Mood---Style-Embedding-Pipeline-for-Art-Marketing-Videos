@@ -680,5 +680,355 @@ class TestIntegration(unittest.TestCase):
             self.assertAlmostEqual(orig["timestamp"], reloaded["timestamp"], places=2)
 
 
+# ---------------------------------------------------------------------------
+# 6. Affective scoring tests (mocked CLIP)
+# ---------------------------------------------------------------------------
+
+class TestAffectiveScorer(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    # Number of frames per synthetic "video" when building test indices
+    _FRAMES_PER_VIDEO = 4
+
+    def _unit_embeddings(self, n: int, dim: int = 16) -> np.ndarray:
+        rng = np.random.default_rng(99)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def _make_index(self, n: int):
+        fpv = self._FRAMES_PER_VIDEO
+        return [
+            {"video_id": f"v{i // fpv}", "frame_idx": i, "timestamp": float(i),
+             "file_path": os.path.join(self.tmp, f"frame_{i}.jpg")}
+            for i in range(n)
+        ]
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_score_frames_shape(self, MockProcessor, MockModel):
+        """score_frames returns one (N,) array per axis."""
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+
+        dim = 16
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        mock_proc.side_effect = _proc
+        MockProcessor.from_pretrained.return_value = mock_proc
+
+        scorer = AffectiveScorer(model_name="mock/clip", axes=DEFAULT_AXES)
+        n = 8
+        embs = self._unit_embeddings(n, dim=dim)
+        scores = scorer.score_frames(embs)
+
+        self.assertEqual(set(scores.keys()), set(DEFAULT_AXES.keys()))
+        for axis_name, arr in scores.items():
+            self.assertEqual(arr.shape, (n,),
+                             f"Axis '{axis_name}' should have shape ({n},).")
+            self.assertEqual(arr.dtype, np.float32)
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_score_frames_range(self, MockProcessor, MockModel):
+        """All affective scores must be in [-1, 1]."""
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        dim = 16
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        mock_proc.side_effect = _proc
+        MockProcessor.from_pretrained.return_value = mock_proc
+
+        scorer = AffectiveScorer(model_name="mock/clip", axes=DEFAULT_AXES)
+        embs = self._unit_embeddings(10, dim=dim)
+        scores = scorer.score_frames(embs)
+
+        for axis_name, arr in scores.items():
+            self.assertLessEqual(float(arr.max()), 2.0 + 1e-5,
+                                 f"Axis '{axis_name}' exceeded +2.")
+            self.assertGreaterEqual(float(arr.min()), -2.0 - 1e-5,
+                                    f"Axis '{axis_name}' below −2.")
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_score_frames_no_nan(self, MockProcessor, MockModel):
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        dim = 16
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        mock_proc.side_effect = _proc
+        MockProcessor.from_pretrained.return_value = mock_proc
+
+        scorer = AffectiveScorer(model_name="mock/clip")
+        embs = self._unit_embeddings(6, dim=dim)
+        scores = scorer.score_frames(embs)
+
+        for axis_name, arr in scores.items():
+            self.assertFalse(np.isnan(arr).any(),
+                             f"Axis '{axis_name}' contains NaN.")
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_score_frames_invalid_input(self, MockProcessor, MockModel):
+        import torch
+        from src.affective_scoring import AffectiveScorer
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        MockModel.from_pretrained.return_value = mock_model
+        MockProcessor.from_pretrained.return_value = MagicMock()
+
+        scorer = AffectiveScorer(model_name="mock/clip")
+        with self.assertRaises(ValueError):
+            scorer.score_frames(np.array([]))
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_score_video_level(self, MockProcessor, MockModel):
+        """Video-level scores aggregate correctly per video."""
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        dim = 16
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        mock_proc.side_effect = _proc
+        MockProcessor.from_pretrained.return_value = mock_proc
+
+        scorer = AffectiveScorer(model_name="mock/clip", axes=DEFAULT_AXES)
+        n = 8
+        embs = self._unit_embeddings(n, dim=dim)
+        index = [
+            {"video_id": "v1" if i < 4 else "v2", "frame_idx": i}
+            for i in range(n)
+        ]
+        frame_scores = scorer.score_frames(embs)
+        video_scores = scorer.score_video_level(frame_scores, index)
+
+        self.assertEqual(set(video_scores.keys()), {"v1", "v2"})
+        for vid, ax_scores in video_scores.items():
+            self.assertEqual(set(ax_scores.keys()), set(DEFAULT_AXES.keys()))
+            for ax, val in ax_scores.items():
+                self.assertIsInstance(val, float)
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_save_scores_creates_json(self, MockProcessor, MockModel):
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        dim = 16
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        mock_proc.side_effect = _proc
+        MockProcessor.from_pretrained.return_value = mock_proc
+
+        scorer = AffectiveScorer(model_name="mock/clip", axes=DEFAULT_AXES)
+        n = 4
+        embs = self._unit_embeddings(n, dim=dim)
+        index = self._make_index(n)
+        frame_scores = scorer.score_frames(embs)
+
+        out = os.path.join(self.tmp, "affective_scores.json")
+        result_path = scorer.save_scores(frame_scores, index, out)
+
+        self.assertTrue(os.path.exists(result_path))
+        with open(result_path) as fh:
+            data = json.load(fh)
+        self.assertEqual(len(data), n)
+        for row in data:
+            for ax in DEFAULT_AXES:
+                self.assertIn(ax, row)
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_plot_heatmap_creates_file(self, MockProcessor, MockModel):
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        dim = 16
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        mock_proc.side_effect = _proc
+        MockProcessor.from_pretrained.return_value = mock_proc
+
+        scorer = AffectiveScorer(model_name="mock/clip", axes=DEFAULT_AXES)
+        n = 6
+        embs = self._unit_embeddings(n, dim=dim)
+        index = self._make_index(n)
+        frame_scores = scorer.score_frames(embs)
+
+        out = os.path.join(self.tmp, "affect_heat.png")
+        result_path = scorer.plot_heatmap(frame_scores, index, out)
+
+        self.assertTrue(os.path.exists(result_path))
+        self.assertGreater(os.path.getsize(result_path), 100)
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_plot_radar_creates_file(self, MockProcessor, MockModel):
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        dim = 16
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        mock_proc = MagicMock()
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        mock_proc.side_effect = _proc
+        MockProcessor.from_pretrained.return_value = mock_proc
+
+        scorer = AffectiveScorer(model_name="mock/clip", axes=DEFAULT_AXES)
+        n = 8
+        embs = self._unit_embeddings(n, dim=dim)
+        index = [{"video_id": "v1" if i < 4 else "v2", "frame_idx": i} for i in range(n)]
+        frame_scores = scorer.score_frames(embs)
+        video_scores = scorer.score_video_level(frame_scores, index)
+
+        out = os.path.join(self.tmp, "radar.png")
+        result_path = scorer.plot_radar(video_scores, out)
+
+        self.assertTrue(os.path.exists(result_path))
+        self.assertGreater(os.path.getsize(result_path), 100)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
