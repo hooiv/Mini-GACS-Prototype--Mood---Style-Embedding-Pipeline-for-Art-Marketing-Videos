@@ -2107,8 +2107,8 @@ class TestSeniorImprovements(unittest.TestCase):
             meta.append({"file_path": p, "video_id": "v1",
                           "frame_idx": i, "timestamp": float(i)})
 
-        with patch("src.embeddings.CLIPProcessor.from_pretrained") as mock_proc, \
-             patch("src.embeddings.CLIPModel.from_pretrained") as mock_model:
+        with patch("src.embeddings.CLIPProcessor") as MockProc, \
+             patch("src.embeddings.CLIPModel") as MockModel:
             import torch
             mm = MagicMock()
             mm.eval.return_value = mm
@@ -2118,13 +2118,13 @@ class TestSeniorImprovements(unittest.TestCase):
                 f = torch.randn(n, 8)
                 return f / f.norm(dim=-1, keepdim=True)
             mm.get_image_features.side_effect = _feat
-            mock_model.return_value = mm
+            MockModel.from_pretrained.return_value = mm
             mp = MagicMock()
             def _proc(*a, images=None, **kw):
                 n = len(images)
                 return {"pixel_values": torch.zeros(n, 3, 16, 16)}
             mp.side_effect = _proc
-            mock_proc.return_value = mp
+            MockProc.from_pretrained.return_value = mp
 
             embs, idx = compute_and_save_embeddings(meta, tmp)
 

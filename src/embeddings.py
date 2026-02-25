@@ -14,9 +14,20 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 from PIL import Image
-from transformers import CLIPModel, CLIPProcessor
+
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:  # pragma: no cover
+    _HAS_TORCH = False
+    torch = None  # type: ignore[assignment]
+
+try:
+    from transformers import CLIPModel, CLIPProcessor
+except ImportError:  # pragma: no cover
+    CLIPModel = None  # type: ignore[assignment]
+    CLIPProcessor = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +53,11 @@ class EmbeddingModel:
         device: Optional[str] = None,
         batch_size: int = 16,
     ) -> None:
+        if not _HAS_TORCH:
+            raise ImportError(
+                "torch and transformers are required for EmbeddingModel. "
+                "Install with: pip install torch transformers"
+            )
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
