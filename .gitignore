@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Data artefacts (generated – not tracked in source control)
+data/videos/*
+data/frames/*
+data/embeddings/*
+data/metadata/*
+
+# Keep the empty directory placeholders
+!data/videos/.gitkeep
+!data/frames/.gitkeep
+!data/embeddings/.gitkeep
+!data/metadata/.gitkeep
+
+# Pipeline outputs (generated)
+outputs/*
+!outputs/.gitkeep
+
+# HuggingFace model cache
+.cache/
+*.safetensors
+
+# Jupyter
+.ipynb_checkpoints/
+# Note: notebook.ipynb is intentionally tracked; only checkpoints are excluded
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

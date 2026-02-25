@@ -1,0 +1,33 @@
+## Core ML / model dependencies
+torch>=2.2
+torchvision>=0.17
+transformers>=4.40
+
+## Computer-vision / image processing
+opencv-python-headless>=4.9
+Pillow>=10.3
+
+## Numerical / data
+numpy>=1.26
+scikit-learn>=1.4
+scipy>=1.12
+
+## Visualisation
+matplotlib>=3.8
+
+## Data handling
+pandas>=2.2
+
+## Utilities
+tqdm>=4.66
+requests>=2.31
+
+## Testing
+pytest>=7.0
+
+## System dependency (not pip-installable)
+## Audio extraction in src/audio_features.py requires ffmpeg on PATH.
+## Install with:  apt install ffmpeg   (Linux)
+##                brew install ffmpeg  (macOS)
+## The pipeline degrades gracefully when ffmpeg is absent (pure-signal
+## functions still work; score_video_audio() returns None with a warning).
