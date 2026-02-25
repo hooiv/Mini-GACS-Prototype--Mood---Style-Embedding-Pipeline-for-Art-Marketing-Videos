@@ -47,7 +47,7 @@ import argparse
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -1267,6 +1267,112 @@ def main() -> None:
 
     except (RuntimeError, ValueError, ImportError, OSError) as exc:
         logger.warning("Online learning step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 18 – Audio feature extraction and cross-modal discord scoring
+    # -----------------------------------------------------------------------
+    print("\n── Step 18: Audio features & cross-modal discord ──────────────────")
+    try:
+        from src.audio_features import (
+            score_video_audio,
+            generate_synthetic_audio_features,
+            map_to_affective_axes,
+            cross_modal_discord_score,
+            AudioExtractionError,
+        )
+
+        video_paths = sorted(
+            {entry.get("video_path", entry.get("file_path", "")) for entry in index
+             if entry.get("video_path") or entry.get("file_path", "").endswith(".mp4")}
+        )
+        # Deduplicate to unique video files
+        video_paths = [p for p in video_paths if os.path.isfile(p) and p.endswith(".mp4")]
+
+        if video_paths and video_level_scores:
+            print(f"  Attempting audio extraction from {len(video_paths)} video(s)…")
+            audio_results: Dict[str, Optional[Dict[str, float]]] = {}
+            for vp in video_paths[:3]:  # cap at 3 to keep demo quick
+                vid_id = os.path.splitext(os.path.basename(vp))[0]
+                audio_aff = score_video_audio(vp)
+                audio_results[vid_id] = audio_aff
+
+            # Fall back to synthetic features when ffmpeg unavailable
+            if all(v is None for v in audio_results.values()):
+                logger.info("ffmpeg unavailable — using synthetic audio features for demo.")
+                synth = generate_synthetic_audio_features(
+                    len(audio_results) or 3, seed=config.seed if hasattr(config, "seed") else 42
+                )
+                for i, vid_id in enumerate(list(audio_results.keys()) or [f"v{j}" for j in range(3)]):
+                    audio_results[vid_id] = map_to_affective_axes(synth[i])
+
+            # Compute cross-modal discord score for each video
+            for vid_id, audio_aff in audio_results.items():
+                if audio_aff is None:
+                    continue
+                vis_aff = video_level_scores.get(vid_id)
+                if vis_aff is None:
+                    # Try matching by partial name
+                    for k in video_level_scores:
+                        if vid_id in k or k in vid_id:
+                            vis_aff = video_level_scores[k]
+                            break
+                if vis_aff:
+                    discord = cross_modal_discord_score(audio_aff, vis_aff)
+                    print(f"  {vid_id}: audio-visual discord = {discord:.4f} "
+                          f"({'⚠ high mismatch' if discord > 0.8 else '✓ aligned'})")
+                    manifest.record(f"audio_discord_{vid_id}", discord=discord)
+                else:
+                    print(f"  {vid_id}: audio scores computed but no visual scores available for discord.")
+        else:
+            # Demo mode: generate synthetic audio and show discord for a synthetic visual
+            print("  No .mp4 paths in index — running audio demo with synthetic data…")
+            synth_feats = generate_synthetic_audio_features(1, seed=0)[0]
+            audio_aff = map_to_affective_axes(synth_feats)
+            synth_visual = {ax: 0.0 for ax in audio_aff}  # neutral visual
+            discord = cross_modal_discord_score(audio_aff, synth_visual)
+            print(f"  Demo audio affective: {audio_aff}")
+            print(f"  Demo audio-visual discord (vs neutral visual): {discord:.4f}")
+            manifest.record("audio_discord_demo", discord=discord)
+
+    except (ImportError, OSError) as exc:
+        logger.warning("Audio features step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 19 – Local embedding vector store (ANN index demo)
+    # -----------------------------------------------------------------------
+    print("\n── Step 19: Embedding vector store (ANN search demo) ──────────────")
+    try:
+        from src.vector_store import EmbeddingVectorStore
+
+        if embeddings is not None and len(embeddings) > 0:
+            store = EmbeddingVectorStore(metric="cosine")
+            store.add(embeddings, index)
+            print(f"  Added {len(store)} frame embeddings to vector store (D={embeddings.shape[1]}).")
+
+            # Demo: query with 3 frames and print top-5 ANN hits
+            query_count = min(3, len(store))
+            for qi in range(query_count):
+                results = store.search(embeddings[qi], k=5)
+                top_ids = [r.idx for r in results]
+                top_scores = [f"{r.score:.4f}" for r in results]
+                print(f"  Query frame {qi}: top-5 ANN hits = {top_ids}  "
+                      f"scores = {top_scores}")
+
+            # Save the store
+            vs_path = os.path.join(OUTPUTS_DIR, "vector_store")
+            store.save(vs_path)
+            print(f"  Vector store saved: {vs_path}.npz + {vs_path}.meta.json")
+            manifest.record(
+                "vector_store",
+                n_vectors=len(store),
+                dim=int(embeddings.shape[1]),
+            )
+            manifest.add_artifact(f"{vs_path}.npz", "EmbeddingVectorStore compressed")
+        else:
+            print("  No embeddings available; skipping vector store step.")
+
+    except (ImportError, OSError, RuntimeError) as exc:
+        logger.warning("Vector store step failed (%s); continuing.", exc)
 
     # -----------------------------------------------------------------------
     # Step 14 – Save run manifest

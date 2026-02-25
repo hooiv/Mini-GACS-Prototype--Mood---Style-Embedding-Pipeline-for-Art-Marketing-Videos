@@ -1060,3 +1060,175 @@ prediction finiteness, RuntimeError before fit, ValueError for wrong feature
 count, CUSUM alarm with large bias, no-alarm on zero-residual data, alarm
 reset, predictive interval shape (`lo ≤ hi`), save/load roundtrip, empty
 residual stats, drift summary keys.
+
+---
+
+## 17. Audio Feature Extraction & Cross-Modal Discord *(implemented — `src/audio_features.py`)*
+
+### Gap (from §2d and §5)
+
+> "Multi-Modal Extension: the pipeline is purely visual.  Adding CLAP audio
+> embeddings and transcript-sentiment BERT features would improve recall for
+> videos where visual cues are ambiguous (e.g., upbeat music over dark imagery)."
+
+Every module built so far operates exclusively on visual frame embeddings.  A
+campaign that pairs tense dark visuals with joyful upbeat music produces a
+*discord* that visual-only affective scoring cannot detect — yet audio-visual
+mismatch is a documented predictor of reduced ad recall (Brackett & McLeod 2000;
+North, Hargreaves & McKendrick 2004).
+
+### Design
+
+`src/audio_features.py` implements the multi-modal extension without requiring
+a large audio model (CLAP, Wav2Vec) or a new GPU dependency.  The module uses
+only **scipy.fft + numpy**, which are already in `requirements.txt`.
+
+**Features computed** on a single audio window:
+
+| Feature | Signal-processing definition | Affective interpretation |
+|---|---|---|
+| RMS energy | √(mean(x²)) | Loudness → energy |
+| Zero-crossing rate | fraction of sign changes | Noisiness → tension |
+| Spectral centroid | power-weighted mean freq | Brightness → energy/tension |
+| Spectral bandwidth | power-weighted std around centroid | Tonal vs broadband → complexity |
+| Spectral rolloff (85th pct) | freq below which 85% of energy lies | High-freq content → tension |
+| MFCC-proxy cepstral means | DCT of log-mel filterbank (scipy) | Timbre texture → complexity |
+
+**Affective axis mapping** — each `[0, 1]` feature is re-scaled to `[-1, 1]`
+then combined with the named-constant weight matrix `_AXIS_WEIGHTS`.  The
+weights are documented inline and chosen so the output matches the expected
+psychoacoustic relationships (loud+bright=energetic, smooth+low-freq=warm, etc.).
+
+**Cross-modal discord score**:
+
+    discord = 1 − cosine_similarity(audio_affective_vector, visual_affective_vector)
+
+Range `[0, 2]`.  A score < 0.4 indicates well-aligned mood; > 0.8 signals
+potential mismatch worth flagging for a creative review.  Near-zero vectors
+(near-silent or near-neutral) return the neutral value 0.5 with a log warning.
+
+**ffmpeg fallback** — `extract_audio_pcm()` requires ffmpeg on PATH and raises
+`AudioExtractionError` (a named exception class) when it is absent.
+`score_video_audio()` catches this and returns `None`, enabling graceful
+degradation.  All pure-signal-processing functions (`extract_audio_features`,
+`map_to_affective_axes`, `cross_modal_discord_score`) work without ffmpeg and
+are independently testable.
+
+*Verified by*: `TestAudioFeatureExtractor` (17 tests) — feature type and
+range checks, MFCC shape, silent audio → zero RMS, int16 auto-normalisation,
+empty array rejection, affective key set, axis range clipping, energy monotonicity
+test (loud > quiet audio → higher energy score), discord identities (same=0,
+opposite=2, zero=0.5), discord bounds over 20 random pairs, synthetic generation
+count + reproducibility, JSON serialisability of `AudioSpectralFeatures.to_dict()`.
+
+---
+
+## 18. Local Embedding Vector Store *(implemented — `src/vector_store.py`)*
+
+### Gap (from §5)
+
+> "Vector DB integration: replacing the in-memory `.npy` store with Qdrant or
+> Pinecone would enable sub-millisecond retrieval at creative library scale."
+
+The current pipeline stores frame embeddings as a flat `.npy` array.  Querying
+it requires loading all N×D floats and doing a brute-force matmul —
+`O(N·D)` per query, acceptable at N=500 but impractical at N=50,000+ for a
+production creative library.
+
+### Design
+
+`EmbeddingVectorStore` provides the same interface that a hosted ANN service
+would expose, without requiring an external process, network connection, or
+heavy native binary (FAISS, HNSWlib).
+
+**Backend**: `sklearn.neighbors.NearestNeighbors(algorithm='brute', metric='cosine')`.
+
+Why brute-force instead of a tree index?
+
+1. **Correctness** — brute-force is exact; tree-based ANN has approximation
+   error that grows with dimension.
+2. **Efficiency in high dimension** — ball-tree and kd-tree degrade to
+   near-brute-force above D~20 (curse of dimensionality).  CLIP ViT-B/32
+   produces D=512 embeddings.  At this dimension, brute-force is faster in
+   practice.
+3. **Zero-dependency** — sklearn is already in `requirements.txt`.
+4. **Upgrade path** — `_build_index()` is a single method; replacing it with
+   a FAISS `IndexFlatIP` or an IVF index requires changing only those 5 lines
+   while all callers remain unchanged.
+
+**Lazy index rebuild** — `_dirty` flag ensures the index is only re-fitted
+when new embeddings have been added since the last `search()`.  For repeated
+add+search cycles this avoids O(N) re-fits per query.
+
+**Thread safety** — `threading.RLock` serialises both `add()` and `_build_index()`
+while allowing concurrent `search()` calls after the first build.
+
+**Persistence** — `save(path)` writes `{path}.npz` (compressed float32 matrix)
+and `{path}.meta.json` (metadata list).  `load(path)` reconstructs the store;
+the index is rebuilt lazily on the first `search()`.
+
+**`SearchResult` dataclass** — typed return value with `idx`, `metadata` (copy),
+and `score` (cosine similarity ∈ `[-1, 1]`).  The score is `1 − cosine_distance`
+because sklearn returns distances, not similarities.
+
+*Verified by*: `TestEmbeddingVectorStore` (12 tests) — add+len, incremental add,
+search returns k, exact match is top hit with score≈1.0, results sorted descending,
+k > n clamped, empty store RuntimeError, dimension mismatch ValueError, metadata
+length mismatch ValueError, save/load roundtrip, repr string, thread-safe
+concurrent add (3 threads × 10 vectors = 30 final).
+
+---
+
+## 19. Performance Bug Fixes
+
+### 19a. Affective Scorer Prompt Embedding Cache (`src/affective_scoring.py`)
+
+**Problem**: `score_frames()` called `self.encode_text([pos_prompt, neg_prompt])`
+inside the axis loop — 2 × 6 = 12 CLIP text forward passes per call.
+`score_frames_ensemble()` called `self.encode_text(10 prompts)` per axis —
+6 × 10 = 60 CLIP text forward passes per call.  The prompts are **static**
+(set at `__init__` time) so these passes were entirely redundant on every
+call after the first.
+
+**Impact**: On CPU (inference ~5 ms/prompt), a batch of 100 frames with
+`score_frames_ensemble()` incurred 300 ms of wasted text encoding per call.
+On GPU the relative cost is lower but still non-zero.
+
+**Fix**: Two prompt-embedding caches added to `AffectiveScorer.__init__`:
+- `_single_cache: Dict[str, Tuple[ndarray, ndarray]]` — pre-warmed at
+  `__init__` via `_prewarm_single_prompt_cache()`; used by `score_frames()`.
+- `_ensemble_cache: Dict[str, Tuple[ndarray, ndarray, ndarray, ndarray]]` —
+  populated lazily on first call to `score_frames_ensemble()` with the default
+  `MULTI_PROMPT_AXES`; reused on all subsequent calls.
+
+Cache is bypassed (and not polluted) when a **custom** `multi_prompt_axes`
+dict is passed to `score_frames_ensemble()`, so user-defined prompt sets still
+encode fresh.
+
+`invalidate_cache()` clears both caches for runtime axis changes.
+
+*Verified by*: `TestAffectiveScorerPromptCache` (5 tests) — cache pre-warmed
+at init with all DEFAULT_AXES keys; zero new `get_text_features` calls during
+`score_frames()`; ensemble cache populated after first call; zero new calls on
+second ensemble call; `invalidate_cache()` empties both dicts.
+
+### 19b. `compute_inter_video_stats` Missing Length Validation (`src/similarity.py`)
+
+**Problem**: If `similarity_matrix.shape[0] != len(index)` (e.g., due to a
+frame filtering step that shrank `index` without regenerating the matrix), the
+boolean video-ID masks would be silently misaligned.  No `ValueError` was raised;
+the statistics would be nonsense with no indication of the bug.
+
+**Fix**: Added an explicit length check at the top of `compute_inter_video_stats`:
+
+```python
+if n != len(index):
+    raise ValueError(
+        f"similarity_matrix.shape[0]={n} does not match len(index)={len(index)}. "
+        "The similarity matrix and index must be aligned."
+    )
+```
+
+*Verified by*: `TestSimilarityIndexLengthGuard` (3 tests) — mismatch raises
+`ValueError` with clear message; correct length passes without error; (0, 0)
+matrix + empty index returns NaN stats without error.

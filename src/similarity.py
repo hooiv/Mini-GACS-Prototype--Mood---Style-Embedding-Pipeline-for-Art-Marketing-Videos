@@ -159,6 +159,11 @@ def compute_inter_video_stats(
         - ``"cross_video_mean"``
     """
     n = similarity_matrix.shape[0]
+    if n != len(index):
+        raise ValueError(
+            f"similarity_matrix.shape[0]={n} does not match len(index)={len(index)}. "
+            "The similarity matrix and index must be aligned."
+        )
     video_ids = np.array([entry.get("video_id", "") for entry in index])
 
     # Upper-triangle mask (excludes diagonal and lower triangle)

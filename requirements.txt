@@ -24,3 +24,10 @@ requests>=2.31
 
 ## Testing
 pytest>=7.0
+
+## System dependency (not pip-installable)
+## Audio extraction in src/audio_features.py requires ffmpeg on PATH.
+## Install with:  apt install ffmpeg   (Linux)
+##                brew install ffmpeg  (macOS)
+## The pipeline degrades gracefully when ffmpeg is absent (pure-signal
+## functions still work; score_video_audio() returns None with a warning).

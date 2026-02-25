@@ -39,9 +39,11 @@ A self-contained Python pipeline that:
 │   ├── ab_testing.py             # Bayesian A/B testing: P(A>B), Thompson sampling, tournament
 │   ├── modality_alignment.py     # CLIP modality gap correction (Liang et al. NeurIPS 2022)
 │   ├── pipeline_config.py        # Typed PipelineConfig dataclass with validation + JSON I/O
-│   └── online_updater.py         # Online SGD predictor + sliding window + CUSUM drift detection
+│   ├── online_updater.py         # Online SGD predictor + sliding window + CUSUM drift detection
+│   ├── audio_features.py         # Audio spectral features + cross-modal discord score (§2d)
+│   └── vector_store.py           # Local ANN vector store (sklearn brute-force cosine, thread-safe)
 ├── tests/
-│   └── test_pipeline.py     # Unit + integration tests (pytest, 256 tests)
+│   └── test_pipeline.py     # Unit + integration tests (pytest, 293 tests)
 ├── data/
 │   ├── videos/              # Source videos (downloaded or user-provided)
 │   ├── frames/              # Extracted frame images (auto-generated)
@@ -52,7 +54,7 @@ A self-contained Python pipeline that:
 ├── pytest.ini               # Pytest discovery configuration
 ├── notebook.ipynb           # Interactive Jupyter walkthrough (all steps)
 ├── download_videos.py       # Helper: download 3 sample CC0 videos
-├── main.py                  # End-to-end pipeline orchestrator (17 steps)
+├── main.py                  # End-to-end pipeline orchestrator (19 steps)
 ├── requirements.txt
 ├── README.md                # This file
 └── REPORT.md                # GenTA / GACS design discussion (§§1–16)

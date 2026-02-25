@@ -4097,3 +4097,424 @@ class TestOnlinePredictor(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
+
+# ===========================================================================
+# TestAudioFeatureExtractor
+# ===========================================================================
+
+class TestAudioFeatureExtractor(unittest.TestCase):
+    """Tests for src/audio_features.py — pure signal-processing functions."""
+
+    _SR = 22_050
+
+    def _sine_wave(self, freq: float = 440.0, duration: float = 1.0) -> np.ndarray:
+        """Generate a pure-tone sine wave at *freq* Hz."""
+        t = np.linspace(0, duration, int(self._SR * duration), endpoint=False)
+        return (np.sin(2 * np.pi * freq * t) * 0.5).astype(np.float32)
+
+    def _silent(self, n: int = 22_050) -> np.ndarray:
+        return np.zeros(n, dtype=np.float32)
+
+    def _noise(self, n: int = 22_050, seed: int = 1) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(n).astype(np.float32) * 0.3
+
+    # ------------------------------------------------------------------
+    # AudioSpectralFeatures
+    # ------------------------------------------------------------------
+
+    def test_extract_features_returns_correct_type(self):
+        from src.audio_features import extract_audio_features, AudioSpectralFeatures
+        feats = extract_audio_features(self._sine_wave(), sr=self._SR)
+        self.assertIsInstance(feats, AudioSpectralFeatures)
+
+    def test_all_scalar_features_in_unit_range(self):
+        from src.audio_features import extract_audio_features
+        feats = extract_audio_features(self._sine_wave(), sr=self._SR)
+        for field in ("rms_energy", "zcr", "spectral_centroid",
+                      "spectral_bandwidth", "spectral_rolloff", "mfcc_var"):
+            val = getattr(feats, field)
+            self.assertGreaterEqual(val, 0.0, f"{field} below 0")
+            self.assertLessEqual(val, 1.0, f"{field} above 1")
+
+    def test_mfcc_shape(self):
+        from src.audio_features import extract_audio_features, _MFCC_N_COEFF
+        feats = extract_audio_features(self._sine_wave(), sr=self._SR)
+        self.assertEqual(feats.mfcc_means.shape, (_MFCC_N_COEFF,))
+
+    def test_silent_audio_low_rms(self):
+        """Silent audio should give near-zero RMS."""
+        from src.audio_features import extract_audio_features
+        feats = extract_audio_features(self._silent(), sr=self._SR)
+        self.assertAlmostEqual(feats.rms_energy, 0.0, places=5)
+
+    def test_spectral_features_silent_audio(self):
+        """Spectral features of silence should all be zero."""
+        from src.audio_features import compute_spectral_features
+        c, bw, ro = compute_spectral_features(self._silent(), sr=self._SR)
+        self.assertAlmostEqual(c, 0.0, places=5)
+        self.assertAlmostEqual(bw, 0.0, places=5)
+        self.assertAlmostEqual(ro, 0.0, places=5)
+
+    def test_int16_audio_normalised_correctly(self):
+        """extract_audio_features should accept int16 PCM and auto-normalise."""
+        from src.audio_features import extract_audio_features
+        audio_i16 = (self._sine_wave() * 32767).astype(np.int16)
+        feats = extract_audio_features(audio_i16, sr=self._SR)
+        # After normalisation RMS should be similar to float32 version
+        feats_f32 = extract_audio_features(self._sine_wave(), sr=self._SR)
+        self.assertAlmostEqual(feats.rms_energy, feats_f32.rms_energy, places=2)
+
+    def test_empty_audio_raises_value_error(self):
+        from src.audio_features import extract_audio_features
+        with self.assertRaises(ValueError):
+            extract_audio_features(np.array([], dtype=np.float32))
+
+    # ------------------------------------------------------------------
+    # map_to_affective_axes
+    # ------------------------------------------------------------------
+
+    def test_map_to_affective_axes_keys(self):
+        from src.audio_features import (
+            extract_audio_features, map_to_affective_axes, _DISCORD_AXES
+        )
+        feats = extract_audio_features(self._sine_wave(), sr=self._SR)
+        scores = map_to_affective_axes(feats)
+        self.assertEqual(set(scores.keys()), set(_DISCORD_AXES))
+
+    def test_map_to_affective_axes_range(self):
+        from src.audio_features import extract_audio_features, map_to_affective_axes
+        feats = extract_audio_features(self._noise(), sr=self._SR)
+        scores = map_to_affective_axes(feats)
+        for axis, val in scores.items():
+            self.assertGreaterEqual(val, -1.0, f"{axis} below -1")
+            self.assertLessEqual(val, 1.0, f"{axis} above 1")
+
+    def test_energy_higher_for_loud_than_silent(self):
+        """Louder audio should produce a higher 'energy' axis score."""
+        from src.audio_features import extract_audio_features, map_to_affective_axes
+        loud = (np.sin(2 * np.pi * 440 * np.linspace(0, 1, self._SR)) * 0.9).astype(np.float32)
+        quiet = self._silent()
+        scores_loud = map_to_affective_axes(extract_audio_features(loud, sr=self._SR))
+        scores_quiet = map_to_affective_axes(extract_audio_features(quiet, sr=self._SR))
+        self.assertGreater(scores_loud["energy"], scores_quiet["energy"])
+
+    # ------------------------------------------------------------------
+    # cross_modal_discord_score
+    # ------------------------------------------------------------------
+
+    def test_discord_identical_vectors_is_zero(self):
+        from src.audio_features import cross_modal_discord_score, _DISCORD_AXES
+        aff = {ax: 0.5 for ax in _DISCORD_AXES}
+        self.assertAlmostEqual(cross_modal_discord_score(aff, aff), 0.0, places=5)
+
+    def test_discord_opposite_vectors_is_two(self):
+        from src.audio_features import cross_modal_discord_score, _DISCORD_AXES
+        pos = {ax: 1.0 for ax in _DISCORD_AXES}
+        neg = {ax: -1.0 for ax in _DISCORD_AXES}
+        self.assertAlmostEqual(cross_modal_discord_score(pos, neg), 2.0, places=5)
+
+    def test_discord_near_zero_vectors_returns_neutral(self):
+        from src.audio_features import cross_modal_discord_score, _DISCORD_AXES
+        zero = {ax: 0.0 for ax in _DISCORD_AXES}
+        self.assertAlmostEqual(cross_modal_discord_score(zero, zero), 0.5, places=5)
+
+    def test_discord_value_in_bounds(self):
+        """Discord should always be in [0, 2]."""
+        from src.audio_features import cross_modal_discord_score, _DISCORD_AXES
+        rng = np.random.default_rng(11)
+        for _ in range(20):
+            a = {ax: float(rng.uniform(-1, 1)) for ax in _DISCORD_AXES}
+            v = {ax: float(rng.uniform(-1, 1)) for ax in _DISCORD_AXES}
+            d = cross_modal_discord_score(a, v)
+            self.assertGreaterEqual(d, 0.0)
+            self.assertLessEqual(d, 2.0 + 1e-6)
+
+    # ------------------------------------------------------------------
+    # generate_synthetic_audio_features
+    # ------------------------------------------------------------------
+
+    def test_generate_synthetic_correct_count(self):
+        from src.audio_features import generate_synthetic_audio_features
+        synth = generate_synthetic_audio_features(n_windows=7, seed=42)
+        self.assertEqual(len(synth), 7)
+
+    def test_generate_synthetic_reproducible(self):
+        from src.audio_features import generate_synthetic_audio_features
+        s1 = generate_synthetic_audio_features(3, seed=99)
+        s2 = generate_synthetic_audio_features(3, seed=99)
+        self.assertAlmostEqual(s1[0].rms_energy, s2[0].rms_energy, places=8)
+
+    def test_to_dict_serialisable(self):
+        """AudioSpectralFeatures.to_dict() should produce a JSON-serialisable dict."""
+        import json
+        from src.audio_features import generate_synthetic_audio_features
+        feats = generate_synthetic_audio_features(1, seed=0)[0]
+        d = feats.to_dict()
+        # Should not raise
+        json.dumps(d)
+
+
+# ===========================================================================
+# TestEmbeddingVectorStore
+# ===========================================================================
+
+class TestEmbeddingVectorStore(unittest.TestCase):
+    """Tests for src/vector_store.py."""
+
+    def _unit_embs(self, n: int, d: int = 16, seed: int = 0) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        raw = rng.standard_normal((n, d)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def _meta(self, n: int) -> list:
+        return [{"frame_id": i, "video_id": f"v{i // 5}"} for i in range(n)]
+
+    def test_add_and_len(self):
+        from src.vector_store import EmbeddingVectorStore
+        store = EmbeddingVectorStore()
+        store.add(self._unit_embs(10), self._meta(10))
+        self.assertEqual(len(store), 10)
+
+    def test_incremental_add(self):
+        from src.vector_store import EmbeddingVectorStore
+        store = EmbeddingVectorStore()
+        store.add(self._unit_embs(5), self._meta(5))
+        store.add(self._unit_embs(3, seed=1), self._meta(3))
+        self.assertEqual(len(store), 8)
+
+    def test_search_returns_k_results(self):
+        from src.vector_store import EmbeddingVectorStore
+        embs = self._unit_embs(20)
+        store = EmbeddingVectorStore()
+        store.add(embs, self._meta(20))
+        results = store.search(embs[0], k=4)
+        self.assertEqual(len(results), 4)
+
+    def test_search_exact_match_is_top_hit(self):
+        """Querying with an embedding that is in the store should return itself first."""
+        from src.vector_store import EmbeddingVectorStore
+        embs = self._unit_embs(15)
+        store = EmbeddingVectorStore()
+        store.add(embs, self._meta(15))
+        results = store.search(embs[3], k=3)
+        self.assertEqual(results[0].idx, 3)
+        self.assertAlmostEqual(results[0].score, 1.0, places=4)
+
+    def test_search_results_sorted_descending(self):
+        from src.vector_store import EmbeddingVectorStore
+        embs = self._unit_embs(20)
+        store = EmbeddingVectorStore()
+        store.add(embs, self._meta(20))
+        results = store.search(embs[0], k=5)
+        scores = [r.score for r in results]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_search_k_larger_than_n_clamped(self):
+        from src.vector_store import EmbeddingVectorStore
+        embs = self._unit_embs(4)
+        store = EmbeddingVectorStore()
+        store.add(embs, self._meta(4))
+        results = store.search(embs[0], k=100)
+        self.assertEqual(len(results), 4)
+
+    def test_empty_store_raises_runtime_error(self):
+        from src.vector_store import EmbeddingVectorStore
+        store = EmbeddingVectorStore()
+        with self.assertRaises(RuntimeError):
+            store.search(np.zeros(16, dtype=np.float32))
+
+    def test_dimension_mismatch_raises_value_error(self):
+        from src.vector_store import EmbeddingVectorStore
+        embs = self._unit_embs(5, d=16)
+        store = EmbeddingVectorStore()
+        store.add(embs, self._meta(5))
+        with self.assertRaises(ValueError):
+            store.search(np.zeros(32, dtype=np.float32))   # wrong dim
+
+    def test_add_metadata_len_mismatch_raises(self):
+        from src.vector_store import EmbeddingVectorStore
+        store = EmbeddingVectorStore()
+        embs = self._unit_embs(5)
+        with self.assertRaises(ValueError):
+            store.add(embs, self._meta(3))  # len mismatch
+
+    def test_save_load_roundtrip(self):
+        from src.vector_store import EmbeddingVectorStore
+        embs = self._unit_embs(10)
+        store = EmbeddingVectorStore()
+        store.add(embs, self._meta(10))
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "vs")
+            store.save(path)
+            store2 = EmbeddingVectorStore.load(path)
+        self.assertEqual(len(store2), 10)
+        # Top hit should be the query itself after reload
+        results = store2.search(embs[7], k=1)
+        self.assertEqual(results[0].idx, 7)
+        self.assertAlmostEqual(results[0].score, 1.0, places=4)
+
+    def test_repr_contains_expected_info(self):
+        from src.vector_store import EmbeddingVectorStore
+        store = EmbeddingVectorStore()
+        store.add(self._unit_embs(5, d=32), self._meta(5))
+        r = repr(store)
+        self.assertIn("n=5", r)
+        self.assertIn("D=32", r)
+        self.assertIn("cosine", r)
+
+    def test_thread_safe_concurrent_add(self):
+        """Three threads add 10 embeddings each; final len should be 30."""
+        import threading
+        from src.vector_store import EmbeddingVectorStore
+        store = EmbeddingVectorStore()
+        errors = []
+
+        def _add_batch(seed):
+            try:
+                embs = self._unit_embs(10, seed=seed)
+                store.add(embs, self._meta(10))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_add_batch, args=(i,)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [], f"Thread errors: {errors}")
+        self.assertEqual(len(store), 30)
+
+
+# ===========================================================================
+# TestAffectiveScorerPromptCache
+# ===========================================================================
+
+class TestAffectiveScorerPromptCache(unittest.TestCase):
+    """Verifies that AffectiveScorer caches prompt embeddings at init time."""
+
+    def _make_scorer(self, MockModel, MockProcessor, dim=16):
+        """Shared helper: build a patched AffectiveScorer and return it with the mock model."""
+        import torch
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+
+        def _get_text(**kwargs):
+            n = kwargs["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _get_text
+        MockModel.from_pretrained.return_value = mock_model
+
+        def _proc(*args, text=None, images=None, return_tensors=None,
+                  padding=None, truncation=None, **kw):
+            batch = text if text is not None else (images or [])
+            n = len(batch)
+            return {"input_ids": torch.zeros(n, 77, dtype=torch.long),
+                    "pixel_values": torch.zeros(n, 3, 224, 224)}
+
+        MockProcessor.from_pretrained.return_value = MagicMock(side_effect=_proc)
+        scorer = AffectiveScorer(model_name="mock/clip", axes=DEFAULT_AXES)
+        return scorer, mock_model
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_single_cache_pre_warmed_at_init(self, MockProcessor, MockModel):
+        """_single_cache should contain all DEFAULT_AXES keys after __init__."""
+        from src.affective_scoring import DEFAULT_AXES
+        scorer, _ = self._make_scorer(MockModel, MockProcessor)
+        self.assertEqual(set(scorer._single_cache.keys()), set(DEFAULT_AXES.keys()))
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_score_frames_no_new_encode_calls(self, MockProcessor, MockModel):
+        """score_frames() should use the cache — zero new encode_text calls."""
+        scorer, mock_model = self._make_scorer(MockModel, MockProcessor)
+        call_count_after_init = mock_model.get_text_features.call_count
+
+        embs = np.random.randn(4, 16).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        scorer.score_frames(embs)
+
+        self.assertEqual(
+            mock_model.get_text_features.call_count,
+            call_count_after_init,
+            "score_frames() made unexpected encode_text calls (cache miss).",
+        )
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_ensemble_cache_populated_on_first_call(self, MockProcessor, MockModel):
+        """_ensemble_cache should be populated after first score_frames_ensemble()."""
+        from src.affective_scoring import MULTI_PROMPT_AXES
+        scorer, _ = self._make_scorer(MockModel, MockProcessor)
+        embs = np.random.randn(4, 16).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        scorer.score_frames_ensemble(embs)
+        self.assertEqual(
+            set(scorer._ensemble_cache.keys()), set(MULTI_PROMPT_AXES.keys())
+        )
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_ensemble_cache_no_new_calls_on_second_use(self, MockProcessor, MockModel):
+        """Second call to score_frames_ensemble() should use cache entirely."""
+        scorer, mock_model = self._make_scorer(MockModel, MockProcessor)
+        embs = np.random.randn(4, 16).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        scorer.score_frames_ensemble(embs)       # first call — populates cache
+        count_after_first = mock_model.get_text_features.call_count
+        scorer.score_frames_ensemble(embs)       # second call — should be cache hit
+        self.assertEqual(mock_model.get_text_features.call_count, count_after_first)
+
+    @patch("src.affective_scoring.CLIPModel")
+    @patch("src.affective_scoring.CLIPProcessor")
+    def test_invalidate_clears_both_caches(self, MockProcessor, MockModel):
+        """invalidate_cache() should empty both _single_cache and _ensemble_cache."""
+        scorer, _ = self._make_scorer(MockModel, MockProcessor)
+        embs = np.random.randn(4, 16).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        scorer.score_frames_ensemble(embs)   # populate ensemble cache
+        scorer.invalidate_cache()
+        self.assertEqual(len(scorer._single_cache), 0)
+        self.assertEqual(len(scorer._ensemble_cache), 0)
+
+
+# ===========================================================================
+# TestSimilarityIndexLengthGuard
+# ===========================================================================
+
+class TestSimilarityIndexLengthGuard(unittest.TestCase):
+    """Verifies the new index-length validation in compute_inter_video_stats."""
+
+    def _make_sim(self, n: int) -> np.ndarray:
+        return np.eye(n, dtype=np.float32)
+
+    def _make_index(self, n: int) -> list:
+        return [{"video_id": f"v{i % 2}"} for i in range(n)]
+
+    def test_mismatch_raises_value_error(self):
+        from src.similarity import compute_inter_video_stats
+        sim = self._make_sim(5)
+        with self.assertRaises(ValueError, msg="Should raise for len(index)=3 != n=5"):
+            compute_inter_video_stats(sim, self._make_index(3))
+
+    def test_correct_length_passes(self):
+        from src.similarity import compute_inter_video_stats
+        n = 6
+        sim = self._make_sim(n)
+        stats = compute_inter_video_stats(sim, self._make_index(n))
+        self.assertIn("overall_mean", stats)
+
+    def test_zero_length_consistent(self):
+        """(0, 0) matrix with empty index should return NaN stats without error."""
+        from src.similarity import compute_inter_video_stats
+        sim = np.zeros((0, 0), dtype=np.float32)
+        stats = compute_inter_video_stats(sim, [])
+        self.assertTrue(np.isnan(stats["overall_mean"]))
+

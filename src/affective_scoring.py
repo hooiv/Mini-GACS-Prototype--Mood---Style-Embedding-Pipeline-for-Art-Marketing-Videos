@@ -203,6 +203,20 @@ class AffectiveScorer:
         self.processor = CLIPProcessor.from_pretrained(model_name)
         self.model = CLIPModel.from_pretrained(model_name).to(device)
         self.model.eval()
+
+        # Pre-compute and cache text embeddings for both scoring modes.
+        # This eliminates redundant CLIP forward passes on every scoring call:
+        #   score_frames()          → 2 prompts/axis × N_axes = 12 passes → 0
+        #   score_frames_ensemble() → 10 prompts/axis × N_axes = 60 → 0
+        # Dict layout:
+        #   _single_cache[axis_name] = (pos_emb (D,), neg_emb (D,))
+        #   _ensemble_cache[axis_name] = (pos_anchor (D,), neg_anchor (D,),
+        #                                  pos_embs (K,D), neg_embs (K,D))
+        self._single_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self._ensemble_cache: Dict[
+            str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = {}
+        self._prewarm_single_prompt_cache()
         logger.info("AffectiveScorer ready with %d axes.", len(self.axes))
 
     # ------------------------------------------------------------------
@@ -227,6 +241,30 @@ class AffectiveScorer:
             text_features = self.model.get_text_features(**inputs)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features.cpu().numpy().astype(np.float32)
+
+    def _prewarm_single_prompt_cache(self) -> None:
+        """
+        Eagerly encode all single-prompt axis pairs and populate
+        ``_single_cache``.  Called once at the end of ``__init__``.
+        """
+        for axis_name, (pos_prompt, neg_prompt) in self.axes.items():
+            embs = self.encode_text([pos_prompt, neg_prompt])
+            self._single_cache[axis_name] = (embs[0], embs[1])
+        logger.debug(
+            "Single-prompt cache pre-warmed for %d axes.", len(self.axes)
+        )
+
+    def invalidate_cache(self) -> None:
+        """
+        Clear both prompt-embedding caches.
+
+        Call this after modifying ``self.axes`` at runtime to force
+        re-encoding on the next :meth:`score_frames` /
+        :meth:`score_frames_ensemble` call.
+        """
+        self._single_cache.clear()
+        self._ensemble_cache.clear()
+        logger.debug("Affective scoring prompt caches invalidated.")
 
     def score_frames(
         self,
@@ -264,9 +302,11 @@ class AffectiveScorer:
         axis_scores: Dict[str, np.ndarray] = {}
 
         for axis_name, (pos_prompt, neg_prompt) in self.axes.items():
-            text_embs = self.encode_text([pos_prompt, neg_prompt])
-            pos_emb = text_embs[0]   # (D,)
-            neg_emb = text_embs[1]   # (D,)
+            # Use cached embeddings if available; populate cache on miss.
+            if axis_name not in self._single_cache:
+                text_embs = self.encode_text([pos_prompt, neg_prompt])
+                self._single_cache[axis_name] = (text_embs[0], text_embs[1])
+            pos_emb, neg_emb = self._single_cache[axis_name]
 
             # Dot product = cosine sim for L2-normalised vectors.
             # Each sim value is in [-1, 1], so their difference spans [-2, 2].
@@ -339,23 +379,39 @@ class AffectiveScorer:
 
         axes_def = multi_prompt_axes or MULTI_PROMPT_AXES
         n = frame_embeddings.shape[0]
+        # Cache is only safe to use when the default MULTI_PROMPT_AXES are in
+        # play; a custom dict may have different prompts under the same names.
+        use_cache = multi_prompt_axes is None
         mean_scores: Dict[str, np.ndarray] = {}
         confidence_scores: Dict[str, np.ndarray] = {}
+        k = 0  # initialised in the loop; declared here for the log message
 
         for axis_name, (pos_prompts, neg_prompts) in axes_def.items():
-            # Encode all positive and negative prompts at once
-            all_prompts = pos_prompts + neg_prompts
-            all_embs = self.encode_text(all_prompts)  # (2K, D)
-            k = len(pos_prompts)
-            pos_embs = all_embs[:k]   # (K, D) — already L2-normalised
-            neg_embs = all_embs[k:]   # (K, D)
+            # Serve from cache when possible, populate on miss.
+            if use_cache and axis_name in self._ensemble_cache:
+                pos_anchor, neg_anchor, pos_embs, neg_embs = (
+                    self._ensemble_cache[axis_name]
+                )
+            else:
+                all_prompts = pos_prompts + neg_prompts
+                all_embs = self.encode_text(all_prompts)  # (2K, D)
+                k = len(pos_prompts)
+                pos_embs = all_embs[:k]   # (K, D) — already L2-normalised
+                neg_embs = all_embs[k:]   # (K, D)
 
-            # Mean-pool in embedding space → average axis anchor vector,
-            # then re-normalise so the anchor remains a unit vector.
-            pos_anchor = pos_embs.mean(axis=0)
-            pos_anchor /= max(np.linalg.norm(pos_anchor), 1e-8)
-            neg_anchor = neg_embs.mean(axis=0)
-            neg_anchor /= max(np.linalg.norm(neg_anchor), 1e-8)
+                # Mean-pool in embedding space → average axis anchor vector,
+                # then re-normalise so the anchor remains a unit vector.
+                pos_anchor = pos_embs.mean(axis=0)
+                pos_anchor /= max(np.linalg.norm(pos_anchor), 1e-8)
+                neg_anchor = neg_embs.mean(axis=0)
+                neg_anchor /= max(np.linalg.norm(neg_anchor), 1e-8)
+
+                if use_cache:
+                    self._ensemble_cache[axis_name] = (
+                        pos_anchor, neg_anchor, pos_embs, neg_embs
+                    )
+
+            k = pos_embs.shape[0]
 
             # Ensemble mean score
             mean_axis_score = np.clip(
