@@ -917,3 +917,146 @@ get the original behaviour.
 
 *Verified by*: `TestTemporalPerVideoStatsFix` — 3 tests confirming backward
 compatibility, correct operation with `consecutive_sims`, and non-negative counts.
+
+---
+
+## 14. CLIP Modality Gap Correction *(implemented — `src/modality_alignment.py`)*
+
+### Gap
+
+Every affective axis score in the pipeline is computed as::
+
+    s_i = sim(image_i, text_positive) − sim(image_i, text_negative)
+
+where `sim` is cosine similarity.  This works *in principle* because CLIP
+learns a joint embedding space.  However, it fails *in practice* due to the
+**modality gap** (Liang et al. "Mind the Gap", NeurIPS 2022): CLIP image
+embeddings and CLIP text embeddings do not occupy the same region of the
+unit sphere.  Instead:
+
+* All image embeddings cluster in one cone (mean cosine similarity between
+  random images: ~0.95).
+* All text embeddings cluster in a *separate* cone (mean cos-sim: ~0.90).
+* The gap vector `g = mean(text) − mean(image)` has L2-norm ≈ 0.30–0.50
+  for ViT-B/32.
+
+**Effect on scores**: even a blank grey image produces non-zero affective
+scores, because the gap between cones dominates the dot product.  This means
+the system cannot reliably distinguish "this ad feels neutral on the tension
+axis" from "this axis is systematically miscalibrated".
+
+### Correction
+
+Symmetric centering (Liang et al. §4.2)::
+
+    corrected_image_i = L2_normalize( image_i  +  gap/2 )
+    corrected_text_j  = L2_normalize( text_j   −  gap/2 )
+
+After correction, both modalities live in the same cone.  The correction:
+- Requires no retraining
+- Takes < 1 ms for library-scale inputs
+- Is idempotent when gap ≈ 0
+
+**`AffectiveScorer.score_frames_gap_corrected()`** applies this correction and
+returns the same `Dict[axis, (N,) array]` interface as `score_frames()`.
+Main.py Step 8 prints the raw vs gap-corrected mean per axis so the user can
+assess the magnitude of the gap in their data.
+
+*Verified by*: `TestModalityAligner` (12 tests) + `TestGapCorrectedScoring`
+(4 tests) — covering shape, no-NaN, range [-2,2], empty input error,
+zero-gap property, save/load, dimension mismatch.
+
+---
+
+## 15. Typed Pipeline Configuration *(implemented — `src/pipeline_config.py`)*
+
+### Gap
+
+`main.py` had a 90-line `parse_args()` function that produced a raw
+`argparse.Namespace`.  This creates three engineering problems:
+
+1. **No type safety** — `args.model` is `str`, `args.interval` is `float`,
+   but both could silently receive the wrong type with no early error.
+2. **No single source of truth** — each module that has its own defaults
+   (e.g., `dedup_threshold = 0.97` in main.py vs
+   `_DEFAULT_DEDUP_THRESH = 0.97` in pipeline_config) risks drifting.
+3. **No serialisation** — the manifest saves a manually-constructed dict
+   from the Namespace; it can easily omit fields added later.
+
+### Solution
+
+`PipelineConfig` is a Python `@dataclass` with:
+
+* **`__post_init__` validation** — `fps > 0`, `max_frames ≥ 1`,
+  `dedup_threshold ∈ [0,1]`, `bootstrap_n ≥ 100`, etc.  Bad values raise
+  `ValueError` at construction time, not silently mid-run.
+* **JSON persistence** — `cfg.save(path)` / `PipelineConfig.load(path)`.
+  The run manifest now records the exact config dict, so any run is exactly
+  reproducible from the saved JSON.
+* **`from_args(ns)` adapter** — maps `args.interval → fps`,
+  `args.model → model_name`, etc.  Existing `parse_args()` in `main.py`
+  works unchanged.
+* **`from_dict(d)` with unknown-key tolerance** — future fields added to
+  the config don't break loading of older saved configs.
+
+*Verified by*: `TestPipelineConfig` (11 tests) — defaults, invalid-value
+exceptions for all constrained fields, `to_dict`/`from_dict` roundtrip, JSON
+save/load, `from_args` mapping, unknown-key tolerance, `repr`.
+
+---
+
+## 16. Online Learning with CUSUM Drift Detection *(implemented — `src/online_updater.py`)*
+
+### Gap (from §5)
+
+> "Online learning: the predictor is batch-trained.  A sliding-window SGD
+> update would let it adapt to seasonality and trend shifts in ad
+> performance."
+
+In production, a creative scoring system sees new campaign performance data
+(CTR, ROAS) daily.  Retraining the Ridge/MLP predictor from scratch on
+every batch has two problems:
+
+1. **Latency** — full retrain + CV + calibration takes minutes, too slow for
+   intraday decisions.
+2. **Catastrophic forgetting** — if the training window grows unbounded,
+   Q1 data still influences Q4 weights, even though Q1 audience behaviour is
+   no longer predictive.
+
+### Solution
+
+`OnlinePredictor` wraps `sklearn.SGDRegressor` (Huber loss for outlier
+robustness) with:
+
+**Warm start** — Ridge coefficients from the batch-trained predictor are
+copied into SGD weights.  The online model starts from a strong prior instead
+of random initialisation, dramatically reducing initial prediction error.
+
+**Sliding window** — a fixed-size FIFO buffer retains only the most recent
+`max_window` samples.  Old data is discarded, ensuring the model tracks the
+current distribution.  `partial_fit` adds new samples and prunes old ones
+atomically.
+
+**Page's CUSUM drift detector** (Page 1954) — maintains two running sums::
+
+    cusum_pos_{t+1} = max(0, cusum_pos_t + residual_t − slack)
+    cusum_neg_{t+1} = max(0, cusum_neg_t − residual_t − slack)
+
+When either exceeds `_CUSUM_THRESHOLD = 5.0`, a drift alarm is raised.
+Named constants `_CUSUM_SLACK = 0.5` and `_CUSUM_THRESHOLD = 5.0` control
+the sensitivity/false-positive tradeoff.  After a full retrain, `reset_cusum()`
+clears the alarm.
+
+**Jackknife predictive interval** — approximates predictive uncertainty
+without distributional assumptions by measuring LOO prediction sensitivity
+in the sliding window.  More principled than heuristic sigma multipliers.
+
+Main.py Step 17 demonstrates the full lifecycle: warm-start → 5 clean
+mini-batches → drift injection (labels artificially set to 10.0) → alarm
+verified → model saved.
+
+*Verified by*: `TestOnlinePredictor` (12 tests) — window growth, pruning,
+prediction finiteness, RuntimeError before fit, ValueError for wrong feature
+count, CUSUM alarm with large bias, no-alarm on zero-residual data, alarm
+reset, predictive interval shape (`lo ≤ hi`), save/load roundtrip, empty
+residual stats, drift summary keys.

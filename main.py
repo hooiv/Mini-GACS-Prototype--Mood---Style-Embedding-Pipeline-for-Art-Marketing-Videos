@@ -49,6 +49,8 @@ import os
 import sys
 from typing import Optional
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # Configure logging before any local imports
 # ---------------------------------------------------------------------------
@@ -98,6 +100,7 @@ from src.text_query import TextQueryRetriever
 from src.drift_detector import EmbeddingDriftDetector
 from src.ab_testing import CreativeABTester
 from src.explainability import OcclusionSaliency
+from src.pipeline_config import PipelineConfig
 
 # ---------------------------------------------------------------------------
 # Default paths (relative to repo root)
@@ -577,6 +580,33 @@ def main() -> None:
         manifest.add_artifact(affective_json, "Frame-level ensemble affective scores")
         manifest.add_artifact(affective_heatmap, "Affective score heatmap (axes x frames)")
         manifest.add_artifact(radar_path, "Affective radar chart (per-video profiles)")
+
+        # Gap-corrected scoring (Liang et al. NeurIPS 2022 modality-gap fix)
+        # compares absolute axis magnitudes to the standard ensemble scores.
+        try:
+            gap_scores = scorer.score_frames_gap_corrected(embeddings, index)
+            print("── Gap-corrected scores (absolute magnitudes after centering) ──")
+            for axis_name, gc_scores in gap_scores.items():
+                raw_mean = float(ens_scores.get(axis_name, gc_scores).mean())
+                gc_mean  = float(gc_scores.mean())
+                print(f"  {axis_name:12s}: raw={raw_mean:+.4f}  "
+                      f"gap-corrected={gc_mean:+.4f}  "
+                      f"Δ={gc_mean - raw_mean:+.4f}")
+            print()
+            manifest.record(
+                "modality_gap_correction",
+                axes=list(gap_scores.keys()),
+                mean_delta={
+                    k: round(
+                        float(gap_scores[k].mean())
+                        - float(ens_scores.get(k, gap_scores[k]).mean()),
+                        4,
+                    )
+                    for k in gap_scores
+                },
+            )
+        except Exception as _gap_exc:  # noqa: BLE001
+            logger.debug("Gap correction diagnostic failed: %s", _gap_exc)
 
         # Update frame_scores to use ensemble for downstream modules
         frame_scores = ens_scores
@@ -1172,6 +1202,71 @@ def main() -> None:
 
     except (RuntimeError, ValueError, OSError, NameError) as exc:
         logger.warning("Occlusion saliency step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 17 – Online learning demo
+    # Warm-starts an OnlinePredictor from the batch-trained Ridge model,
+    # ingest a small stream of simulated incoming performance data, checks
+    # for concept drift, and logs predictive-interval statistics.
+    # -----------------------------------------------------------------------
+    logger.info("=== Step 17: Online learning demo ===")
+    try:
+        from src.online_updater import OnlinePredictor
+        from src.performance_predictor import generate_synthetic_performance_data
+
+        # Build a quick batch predictor to warm-start from
+        _tmp_predictor = VibePerformancePredictor(n_epochs=50, random_state=42)
+        _feat_names = build_feature_names()
+        _syn_X, _syn_y = generate_synthetic_performance_data(
+            n_samples=60, noise_std=0.05, random_state=42
+        )
+        _tmp_predictor.fit(_syn_X, _syn_y, feature_names=_feat_names)
+
+        online = OnlinePredictor.from_batch_predictor(
+            _tmp_predictor, max_window=200
+        )
+
+        # Simulate arriving performance stream in 5 mini-batches
+        rng_stream = np.random.default_rng(7)
+        for batch_i in range(5):
+            X_new, y_new = generate_synthetic_performance_data(
+                n_samples=8, noise_std=0.05, random_state=int(rng_stream.integers(1000))
+            )
+            online.partial_fit(X_new, y_new)
+
+        res = online.residual_stats()
+        print(
+            f"\n── Online predictor after 40 new samples ──\n"
+            f"  Window size:      {online.window_size}\n"
+            f"  Mean residual:    {res.get('mean_residual', 0.0):+.4f}\n"
+            f"  Std residual:     {res.get('std_residual', 0.0):.4f}\n"
+            f"  Drift alarm:      {online.drift_detected()}"
+        )
+
+        # Inject 20 highly biased samples to trigger CUSUM alarm
+        X_drift = rng_stream.random((20, online.n_features)).astype(np.float32)
+        y_drift = np.full(20, 5.0)   # artificially high labels → large residuals
+        online.partial_fit(X_drift, y_drift)
+        ds = online.drift_summary()
+        print(
+            f"  After drift injection: alarm={ds['drift_alarm']}  "
+            f"cusum_pos={ds['cusum_pos']:.2f}  "
+            f"cusum_neg={ds['cusum_neg']:.2f}"
+        )
+
+        online_path = os.path.join(OUTPUTS_DIR, "online_predictor.npz")
+        online.save(online_path)
+        print(f"  Online predictor saved: {online_path}")
+        manifest.record(
+            "online_learning",
+            window_size=online.window_size,
+            n_updates=online.n_updates,
+            drift_alarm=online.drift_detected(),
+        )
+        manifest.add_artifact(online_path, "OnlinePredictor model state")
+
+    except (RuntimeError, ValueError, ImportError, OSError) as exc:
+        logger.warning("Online learning step failed (%s); continuing.", exc)
 
     # -----------------------------------------------------------------------
     # Step 14 – Save run manifest

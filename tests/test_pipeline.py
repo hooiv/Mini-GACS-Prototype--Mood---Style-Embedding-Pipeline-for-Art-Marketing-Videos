@@ -1035,6 +1035,90 @@ class TestAffectiveScorer(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Gap-corrected scoring tests
+# ---------------------------------------------------------------------------
+
+class TestGapCorrectedScoring(unittest.TestCase):
+    """Tests for AffectiveScorer.score_frames_gap_corrected."""
+
+    def _unit_embeddings(self, n: int, dim: int = 16) -> np.ndarray:
+        rng = np.random.default_rng(77)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def _make_scorer(self, dim: int = 16):
+        """Return (scorer, DEFAULT_AXES) with CLIP mocked."""
+        import torch
+        import src.affective_scoring  # ensure module is in sys.modules
+        from src.affective_scoring import AffectiveScorer, DEFAULT_AXES
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+
+        def _text(**kw):
+            n = kw["input_ids"].shape[0]
+            f = torch.randn(n, dim)
+            return f / f.norm(dim=-1, keepdim=True)
+
+        mock_model.get_text_features.side_effect = _text
+
+        def _proc(*args, text=None, images=None,
+                  return_tensors=None, padding=None, truncation=None, **kw):
+            texts = text if text is not None else []
+            n = len(texts) if texts else 1
+            return {"input_ids": torch.ones(n, 10, dtype=torch.long)}
+
+        mock_proc = MagicMock()
+        mock_proc.side_effect = _proc
+
+        with patch("src.affective_scoring.CLIPModel") as MM, \
+             patch("src.affective_scoring.CLIPProcessor") as MP:
+            MM.from_pretrained.return_value = mock_model
+            MP.from_pretrained.return_value = mock_proc
+            scorer = AffectiveScorer(axes=DEFAULT_AXES)
+        # Manually replace the internal model/processor references
+        scorer.model = mock_model
+        scorer.processor = mock_proc
+        return scorer, DEFAULT_AXES
+
+    def test_gap_corrected_shape(self):
+        """score_frames_gap_corrected returns one (N,) array per axis."""
+        scorer, DEFAULT_AXES = self._make_scorer()
+        embs = self._unit_embeddings(12)
+        scores = scorer.score_frames_gap_corrected(embs)
+        self.assertEqual(set(scores.keys()), set(DEFAULT_AXES.keys()))
+        for v in scores.values():
+            self.assertEqual(v.shape, (12,))
+
+    def test_gap_corrected_no_nan(self):
+        """No NaN values in gap-corrected scores."""
+        scorer, _ = self._make_scorer()
+        embs = self._unit_embeddings(8)
+        scores = scorer.score_frames_gap_corrected(embs)
+        for v in scores.values():
+            self.assertFalse(np.any(np.isnan(v)),
+                             "Gap-corrected scores contain NaN.")
+
+    def test_gap_corrected_range(self):
+        """Gap-corrected scores are clipped to [-2, 2]."""
+        scorer, _ = self._make_scorer()
+        embs = self._unit_embeddings(10)
+        scores = scorer.score_frames_gap_corrected(embs)
+        for name, v in scores.items():
+            self.assertLessEqual(float(np.max(v)), 2.0 + 1e-5,
+                                 f"Axis '{name}' exceeds +2.0.")
+            self.assertGreaterEqual(float(np.min(v)), -2.0 - 1e-5,
+                                    f"Axis '{name}' is below -2.0.")
+
+    def test_gap_corrected_empty_raises(self):
+        """Empty embedding array raises ValueError."""
+        scorer, _ = self._make_scorer()
+        with self.assertRaises(ValueError):
+            scorer.score_frames_gap_corrected(np.empty((0, 16), dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
 # 7. Clustering tests (pure NumPy + sklearn – no CLIP model needed)
 # ---------------------------------------------------------------------------
 
@@ -3644,6 +3728,370 @@ class TestTemporalPerVideoStatsFix(unittest.TestCase):
         # Both should return valid (non-negative) transition counts
         self.assertGreaterEqual(stats_windowed["single_vid"]["n_transitions"], 0.0)
         self.assertGreaterEqual(stats_consec["single_vid"]["n_transitions"], 0.0)
+
+
+# ===========================================================================
+# TestModalityAligner — CLIP modality gap correction
+# ===========================================================================
+
+class TestModalityAligner(unittest.TestCase):
+    """Tests for src.modality_alignment.ModalityAligner."""
+
+    def _rand_l2(self, rng, n: int, d: int) -> np.ndarray:
+        """Return (n, d) L2-normalised float32 embeddings."""
+        x = rng.random((n, d)).astype(np.float32)
+        x /= np.linalg.norm(x, axis=1, keepdims=True) + 1e-8
+        return x
+
+    def test_fit_gap_shape(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(0)
+        img = self._rand_l2(rng, 20, 32)
+        txt = self._rand_l2(rng, 10, 32)
+        al  = ModalityAligner().fit(img, txt)
+        self.assertEqual(al.gap.shape, (32,))
+
+    def test_gap_nonzero_for_distinct_modalities(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(1)
+        # Offset text embeddings so gap is non-trivial
+        img = self._rand_l2(rng, 20, 32)
+        txt = self._rand_l2(rng, 10, 32) + 0.5  # shift to different cone
+        txt /= np.linalg.norm(txt, axis=1, keepdims=True) + 1e-8
+        al  = ModalityAligner().fit(img, txt)
+        self.assertGreater(al.gap_magnitude, 0.01)
+
+    def test_correct_image_l2_normalised(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(2)
+        img = self._rand_l2(rng, 15, 32)
+        txt = self._rand_l2(rng, 8, 32)
+        al  = ModalityAligner().fit(img, txt)
+        corr = al.correct_image(img)
+        norms = np.linalg.norm(corr, axis=1)
+        np.testing.assert_allclose(norms, np.ones(15), atol=1e-5)
+
+    def test_correct_text_l2_normalised(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(3)
+        img = self._rand_l2(rng, 15, 32)
+        txt = self._rand_l2(rng, 8, 32)
+        al  = ModalityAligner().fit(img, txt)
+        corr = al.correct_text(txt)
+        norms = np.linalg.norm(corr, axis=1)
+        np.testing.assert_allclose(norms, np.ones(8), atol=1e-5)
+
+    def test_zero_gap_for_same_modality(self):
+        """When image == text embeddings, the gap should be ~0."""
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(4)
+        x  = self._rand_l2(rng, 12, 32)
+        al = ModalityAligner().fit(x, x)
+        self.assertAlmostEqual(al.gap_magnitude, 0.0, places=5)
+
+    def test_cosine_similarity_corrected_shape(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(5)
+        img = self._rand_l2(rng, 10, 32)
+        txt = self._rand_l2(rng, 4, 32)
+        al  = ModalityAligner().fit(img, txt)
+        sim = al.cosine_similarity_corrected(img, txt)
+        self.assertEqual(sim.shape, (10, 4))
+
+    def test_save_load_roundtrip(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(6)
+        img = self._rand_l2(rng, 10, 16)
+        txt = self._rand_l2(rng, 6, 16)
+        al  = ModalityAligner().fit(img, txt)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "aligner.npz")
+            al.save(path)
+            al2 = ModalityAligner.load(path)
+        np.testing.assert_array_equal(al.gap, al2.gap)
+        self.assertAlmostEqual(al.gap_magnitude, al2.gap_magnitude, places=6)
+
+    def test_unfit_correct_image_raises(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(7)
+        img = self._rand_l2(rng, 5, 16)
+        with self.assertRaises(RuntimeError):
+            ModalityAligner().correct_image(img)
+
+    def test_dimension_mismatch_raises(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(8)
+        img = self._rand_l2(rng, 5, 16)
+        txt = self._rand_l2(rng, 4, 32)   # different D
+        with self.assertRaises(ValueError):
+            ModalityAligner().fit(img, txt)
+
+    def test_empty_input_raises(self):
+        from src.modality_alignment import ModalityAligner
+        img = np.empty((0, 16), dtype=np.float32)
+        txt = np.random.rand(4, 16).astype(np.float32)
+        with self.assertRaises(ValueError):
+            ModalityAligner().fit(img, txt)
+
+    def test_gap_summary_keys(self):
+        from src.modality_alignment import ModalityAligner
+        rng = np.random.default_rng(9)
+        al  = ModalityAligner().fit(
+            self._rand_l2(rng, 8, 16), self._rand_l2(rng, 4, 16)
+        )
+        s = al.gap_summary()
+        self.assertIn("gap_magnitude", s)
+        self.assertIn("mean_image_norm", s)
+        self.assertIn("mean_text_norm", s)
+        self.assertIn("embedding_dim", s)
+        self.assertEqual(s["embedding_dim"], 16)
+
+    def test_load_missing_file_raises(self):
+        from src.modality_alignment import ModalityAligner
+        with self.assertRaises(FileNotFoundError):
+            ModalityAligner.load("/nonexistent/path/aligner.npz")
+
+
+# ===========================================================================
+# TestPipelineConfig — typed configuration
+# ===========================================================================
+
+class TestPipelineConfig(unittest.TestCase):
+    """Tests for src.pipeline_config.PipelineConfig."""
+
+    def test_defaults_valid(self):
+        from src.pipeline_config import PipelineConfig
+        cfg = PipelineConfig()
+        self.assertGreater(cfg.fps, 0)
+        self.assertGreater(cfg.max_frames, 0)
+        self.assertGreater(cfg.top_k, 0)
+
+    def test_invalid_fps_raises(self):
+        from src.pipeline_config import PipelineConfig
+        with self.assertRaises(ValueError):
+            PipelineConfig(fps=-1.0)
+
+    def test_invalid_max_frames_raises(self):
+        from src.pipeline_config import PipelineConfig
+        with self.assertRaises(ValueError):
+            PipelineConfig(max_frames=0)
+
+    def test_invalid_dedup_threshold_raises(self):
+        from src.pipeline_config import PipelineConfig
+        with self.assertRaises(ValueError):
+            PipelineConfig(dedup_threshold=1.5)
+
+    def test_invalid_min_quality_raises(self):
+        from src.pipeline_config import PipelineConfig
+        with self.assertRaises(ValueError):
+            PipelineConfig(min_quality_score=-0.1)
+
+    def test_invalid_bootstrap_n_raises(self):
+        from src.pipeline_config import PipelineConfig
+        with self.assertRaises(ValueError):
+            PipelineConfig(bootstrap_n=10)
+
+    def test_to_dict_from_dict_roundtrip(self):
+        from src.pipeline_config import PipelineConfig
+        cfg  = PipelineConfig(fps=2.0, n_clusters=5, top_k=3)
+        cfg2 = PipelineConfig.from_dict(cfg.to_dict())
+        self.assertEqual(cfg.fps, cfg2.fps)
+        self.assertEqual(cfg.n_clusters, cfg2.n_clusters)
+        self.assertEqual(cfg.top_k, cfg2.top_k)
+
+    def test_save_load_json(self):
+        from src.pipeline_config import PipelineConfig
+        cfg = PipelineConfig(fps=1.5, max_frames=30)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "cfg.json")
+            cfg.save(path)
+            self.assertTrue(os.path.isfile(path))
+            cfg2 = PipelineConfig.load(path)
+        self.assertAlmostEqual(cfg.fps, cfg2.fps)
+        self.assertEqual(cfg.max_frames, cfg2.max_frames)
+
+    def test_load_missing_raises(self):
+        from src.pipeline_config import PipelineConfig
+        with self.assertRaises(FileNotFoundError):
+            PipelineConfig.load("/nonexistent/config.json")
+
+    def test_from_args_maps_interval_to_fps(self):
+        from src.pipeline_config import PipelineConfig
+        import argparse
+        ns = argparse.Namespace(
+            interval=2.0,
+            model="openai/clip-vit-base-patch32",
+            max_frames=40,
+            top_k=5,
+            n_queries=3,
+            n_clusters=0,
+            dedup_threshold=0.97,
+            min_quality_score=0.25,
+            bootstrap_n=1000,
+            scene_adaptive=False,
+            skip_download=False,
+            skip_extraction=False,
+            skip_embedding=False,
+            skip_similarity=False,
+        )
+        cfg = PipelineConfig.from_args(ns)
+        self.assertAlmostEqual(cfg.fps, 2.0)
+        self.assertEqual(cfg.model_name, "openai/clip-vit-base-patch32")
+        self.assertEqual(cfg.max_frames, 40)
+
+    def test_unknown_keys_ignored_in_from_dict(self):
+        from src.pipeline_config import PipelineConfig
+        d = PipelineConfig().to_dict()
+        d["future_unknown_field"] = "ignored"
+        cfg = PipelineConfig.from_dict(d)
+        self.assertFalse(hasattr(cfg, "future_unknown_field"))
+
+    def test_repr_contains_fps(self):
+        from src.pipeline_config import PipelineConfig
+        cfg = PipelineConfig(fps=3.0)
+        self.assertIn("fps", repr(cfg))
+        self.assertIn("3.0", repr(cfg))
+
+
+# ===========================================================================
+# TestOnlinePredictor — incremental SGD with CUSUM drift detection
+# ===========================================================================
+
+class TestOnlinePredictor(unittest.TestCase):
+    """Tests for src.online_updater.OnlinePredictor."""
+
+    def _make_data(self, n: int = 20, d: int = 6, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        X = rng.random((n, d)).astype(np.float32)
+        w = rng.random(d).astype(np.float32)
+        y = X @ w + 0.05 * rng.standard_normal(n).astype(np.float32)
+        return X, y
+
+    def test_partial_fit_grows_window(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        X, y = self._make_data(10)
+        op.partial_fit(X, y)
+        self.assertEqual(op.window_size, 10)
+        self.assertEqual(op.n_updates, 10)
+
+    def test_window_capped_at_max_window(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6, max_window=15)
+        for _ in range(4):
+            X, y = self._make_data(10)
+            op.partial_fit(X, y)
+        self.assertLessEqual(op.window_size, 15)
+
+    def test_predict_returns_finite_values(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        X, y = self._make_data(20)
+        op.partial_fit(X, y)
+        preds = op.predict(X[:5])
+        self.assertEqual(preds.shape, (5,))
+        self.assertTrue(np.all(np.isfinite(preds)))
+
+    def test_predict_before_fit_raises(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        X, _ = self._make_data(5)
+        with self.assertRaises(RuntimeError):
+            op.predict(X)
+
+    def test_wrong_n_features_raises(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        X, y = self._make_data(10)
+        op.partial_fit(X, y)
+        X_wrong = np.random.rand(5, 8).astype(np.float32)
+        with self.assertRaises(ValueError):
+            op.partial_fit(X_wrong, np.zeros(5))
+
+    def test_no_cusum_alarm_with_zero_bias(self):
+        """Model predicts accurately → CUSUM should stay quiet."""
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        # Feed perfectly predicted samples (y ≈ 0 always → near-zero residuals)
+        for _ in range(20):
+            X = np.zeros((5, 6), dtype=np.float64)
+            y = np.zeros(5, dtype=np.float64)
+            op.partial_fit(X, y)
+        # Allow some false positives but expect no alarm on constant-zero data
+        # (residuals will be exactly 0 after the model converges to w=0)
+        ds = op.drift_summary()
+        self.assertIn("drift_alarm", ds)
+        self.assertIn("cusum_pos", ds)
+
+    def test_cusum_alarm_with_large_bias(self):
+        """Systematically large residuals should trigger the CUSUM alarm."""
+        from src.online_updater import OnlinePredictor
+        # Prime the model on low-label data
+        op = OnlinePredictor(n_features=6, random_state=42)
+        X0, _ = self._make_data(20, seed=0)
+        op.partial_fit(X0, np.zeros(20))  # model learns y ≈ 0
+
+        # Now inject labels far from 0 → large residuals accumulate
+        for _ in range(30):
+            X_bias = np.ones((5, 6), dtype=np.float64) * 0.5
+            y_bias = np.full(5, 10.0)   # model predicts ≈0, label=10 → big error
+            op.partial_fit(X_bias, y_bias)
+
+        self.assertTrue(op.drift_detected())
+
+    def test_reset_cusum_clears_alarm(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        # Force alarm
+        op._drift_alarm = True
+        op._cusum_pos   = 99.0
+        op.reset_cusum()
+        self.assertFalse(op.drift_detected())
+        self.assertAlmostEqual(op._cusum_pos, 0.0)
+
+    def test_predict_with_interval_has_correct_shape(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6, random_state=42)
+        for _ in range(6):        # fill window to ≥ 5 samples
+            X, y = self._make_data(10, seed=_)
+            op.partial_fit(X, y)
+        X_q = self._make_data(4)[0]
+        mean, lo, hi = op.predict_with_interval(X_q)
+        self.assertEqual(mean.shape, (4,))
+        self.assertEqual(lo.shape, (4,))
+        self.assertEqual(hi.shape, (4,))
+        self.assertTrue(np.all(hi >= lo))
+
+    def test_save_load_roundtrip(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        X, y = self._make_data(20)
+        op.partial_fit(X, y)
+        preds_before = op.predict(X[:3])
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "online.npz")
+            op.save(path)
+            op2 = OnlinePredictor.load(path)
+        preds_after = op2.predict(X[:3])
+        np.testing.assert_allclose(preds_before, preds_after, atol=1e-5)
+        self.assertEqual(op.n_updates, op2.n_updates)
+
+    def test_residual_stats_empty_returns_empty_dict(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        self.assertEqual(op.residual_stats(), {})
+
+    def test_drift_summary_keys(self):
+        from src.online_updater import OnlinePredictor
+        op = OnlinePredictor(n_features=6)
+        X, y = self._make_data(10)
+        op.partial_fit(X, y)
+        s = op.drift_summary()
+        self.assertIn("cusum_pos", s)
+        self.assertIn("cusum_neg", s)
+        self.assertIn("threshold", s)
+        self.assertIn("drift_alarm", s)
+        self.assertIn("n_updates", s)
 
 
 if __name__ == "__main__":

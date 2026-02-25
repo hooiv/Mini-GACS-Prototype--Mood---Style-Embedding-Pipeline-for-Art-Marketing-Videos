@@ -36,9 +36,12 @@ A self-contained Python pipeline that:
 │   ├── text_query.py             # Text-guided creative retrieval (CLIP text-to-image search)
 │   ├── drift_detector.py         # Embedding distribution drift monitoring (MMD + KS + IF)
 │   ├── explainability.py         # Occlusion saliency: spatial importance maps for affective scores
-│   └── ab_testing.py             # Bayesian A/B testing: P(A>B), Thompson sampling, tournament
+│   ├── ab_testing.py             # Bayesian A/B testing: P(A>B), Thompson sampling, tournament
+│   ├── modality_alignment.py     # CLIP modality gap correction (Liang et al. NeurIPS 2022)
+│   ├── pipeline_config.py        # Typed PipelineConfig dataclass with validation + JSON I/O
+│   └── online_updater.py         # Online SGD predictor + sliding window + CUSUM drift detection
 ├── tests/
-│   └── test_pipeline.py     # Unit + integration tests (pytest, 216 tests)
+│   └── test_pipeline.py     # Unit + integration tests (pytest, 256 tests)
 ├── data/
 │   ├── videos/              # Source videos (downloaded or user-provided)
 │   ├── frames/              # Extracted frame images (auto-generated)
@@ -49,10 +52,10 @@ A self-contained Python pipeline that:
 ├── pytest.ini               # Pytest discovery configuration
 ├── notebook.ipynb           # Interactive Jupyter walkthrough (all steps)
 ├── download_videos.py       # Helper: download 3 sample CC0 videos
-├── main.py                  # End-to-end pipeline orchestrator (16 steps)
+├── main.py                  # End-to-end pipeline orchestrator (17 steps)
 ├── requirements.txt
 ├── README.md                # This file
-└── REPORT.md                # GenTA / GACS design discussion
+└── REPORT.md                # GenTA / GACS design discussion (§§1–16)
 ```
 
 ---

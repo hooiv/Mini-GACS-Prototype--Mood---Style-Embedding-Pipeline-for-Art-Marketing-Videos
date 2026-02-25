@@ -418,6 +418,74 @@ class AffectiveScorer:
 
         return video_scores
 
+    def score_frames_gap_corrected(
+        self,
+        frame_embeddings: np.ndarray,
+        index: Optional[List[Dict]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute affective scores with CLIP modality-gap correction applied.
+
+        Calls :class:`~src.modality_alignment.ModalityAligner` to remove the
+        systematic bias caused by image and text embeddings occupying different
+        cones of the unit sphere (Liang et al. NeurIPS 2022).  See
+        ``src/modality_alignment.py`` for a full explanation of the problem
+        and the correction algorithm.
+
+        The correction shifts both modalities by half the gap vector before
+        computing cosine similarities.  After correction, axis scores are more
+        sensitive to genuine semantic content and less influenced by the
+        structural offset between modalities.
+
+        Args:
+            frame_embeddings:  L2-normalised image embeddings ``(N, D)``.
+            index:             Optional metadata list (passed through unused).
+
+        Returns:
+            Same format as :meth:`score_frames`: ``Dict[axis_name → (N,)
+            float32]`` with values clipped to ``[-2, 2]``.
+
+        Raises:
+            ValueError: if ``frame_embeddings`` is not 2-D or is empty.
+        """
+        from src.modality_alignment import ModalityAligner
+
+        if frame_embeddings.ndim != 2 or frame_embeddings.shape[0] == 0:
+            raise ValueError(
+                f"Expected 2-D non-empty array; got shape {frame_embeddings.shape}."
+            )
+
+        # Collect all text anchors for fitting the aligner
+        all_text_embs = []
+        for axis_name, (pos_prompt, neg_prompt) in self.axes.items():
+            pair_embs = self.encode_text([pos_prompt, neg_prompt])
+            all_text_embs.append(pair_embs)
+        text_matrix = np.vstack(all_text_embs)  # (2 * n_axes, D)
+
+        aligner = ModalityAligner()
+        aligner.fit(frame_embeddings, text_matrix)
+
+        corrected_frames = aligner.correct_image(frame_embeddings)
+
+        axis_scores: Dict[str, np.ndarray] = {}
+        for axis_name, (pos_prompt, neg_prompt) in self.axes.items():
+            text_embs = self.encode_text([pos_prompt, neg_prompt])
+            corr_pos  = aligner.correct_text(text_embs[[0]])
+            corr_neg  = aligner.correct_text(text_embs[[1]])
+
+            pos_sims = (corrected_frames @ corr_pos[0]).astype(np.float32)
+            neg_sims = (corrected_frames @ corr_neg[0]).astype(np.float32)
+            scores   = np.clip(pos_sims - neg_sims, -2.0, 2.0)
+            axis_scores[axis_name] = scores
+
+        gap_mag = aligner.gap_magnitude
+        logger.info(
+            "Gap-corrected scoring complete "
+            "(gap_magnitude=%.4f, N=%d, axes=%d).",
+            gap_mag, frame_embeddings.shape[0], len(self.axes),
+        )
+        return axis_scores
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
