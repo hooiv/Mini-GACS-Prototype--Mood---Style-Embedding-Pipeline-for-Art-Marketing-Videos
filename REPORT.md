@@ -1232,3 +1232,104 @@ if n != len(index):
 *Verified by*: `TestSimilarityIndexLengthGuard` (3 tests) — mismatch raises
 `ValueError` with clear message; correct length passes without error; (0, 0)
 matrix + empty index returns NaN stats without error.
+
+---
+
+## 20. Cross-Modal Affective Fusion (`src/cross_modal_fusion.py`)
+
+### Motivation
+
+The pipeline previously computed audio affective scores (`audio_features.py`)
+and visual affective scores (`affective_scoring.py`) completely independently
+and reported them in parallel.  This ignores a fundamental question: **which
+modality should we trust more for a given frame and axis?**
+
+A silent-cinema-style advert has meaningful visual but near-random audio
+affective scores.  Naively averaging them degrades the visual signal by 50%.
+Conversely, a radio-style "talking head" video has highly stable audio but
+noisy visual scores (speaker's face is neutral; affective content is sonic).
+
+### Solution: Product-of-Gaussians Bayesian Fusion
+
+Given independent Gaussian measurements of latent affective value θ:
+
+```
+visual: θ ~ N(μ_v, σ_v²)
+audio:  θ ~ N(μ_a, σ_a²)
+
+Posterior (product of Gaussians, Murphy 2007):
+  σ_fused² = 1 / (1/σ_v² + 1/σ_a²)      ← precision sum
+  μ_fused  = σ_fused² × (μ_v/σ_v² + μ_a/σ_a²)  ← precision-weighted mean
+```
+
+**Visual uncertainty** is derived from the ensemble confidence score:
+`σ_v² = max(1 - confidence, ε)`.  When all 5 prompt phrasings agree
+(confidence ≈ 1), the frame embedding sits firmly on one side of the axis
+hyperplane and visual variance is near-zero → visual dominates fusion.
+When phrasings disagree, audio gets a larger share.
+
+**Audio uncertainty** is estimated from proximity to the normalisation
+clipping threshold: `σ_a² = |audio_score| / clipping_threshold`.  A saturated
+feature (score ≈ 1.0) has high variance because the underlying physical value
+is unknown (only a lower bound is observed).
+
+This is mathematically equivalent to a **precision-weighted committee** and
+is optimal under the Gaussian likelihood assumption.
+
+### Properties verified
+- Equal variances → arithmetic mean (unit test)
+- Low visual variance → visual dominates (unit test)
+- Posterior variance < min(σ_v², σ_a²) always (unit test)
+- Visual + audio weights sum to 1.0 per axis (unit test)
+- Batch fusion with per-frame confidence array preserves shape (unit test)
+
+---
+
+## 21. Embedding Health Inspector (`src/embedding_inspector.py`)
+
+### Motivation
+
+Before trusting similarity heatmaps, cluster labels, affective scores, or
+A/B test outcomes, we need to verify that the embedding set is *geometrically
+healthy*.  Three failure modes are common:
+
+1. **Representation collapse** — fine-tuned or quantised CLIP encodes most
+   inputs to nearly the same vector.  Cosine similarities cluster near 1.0;
+   the heatmap is almost uniformly red; clusters are meaningless.
+2. **Modality gap anisotropy** — CLIP image embeddings are systematically
+   offset from the text embedding cloud (Liang et al. NeurIPS 2022).  This
+   shows up as high anisotropy and inflated text-image cosine similarities.
+3. **Low intrinsic dimensionality** — the actual variation lives on a 5-D
+   manifold inside 512-D space.  K-means behaves strangely; cluster count
+   selected by silhouette may not reflect real semantic clusters.
+
+### Metrics
+
+| Metric | Estimator | Interpretation |
+|---|---|---|
+| **Intrinsic dimensionality** | TwoNN (Facco et al. 2017) | True degrees of freedom in the data |
+| **Effective rank** | Roy-Vetterli entropy of SVD spectrum | How many PCA components carry signal |
+| **Participation ratio** | (Σλ)²/Σλ² | Sensitive to a few dominant eigenvalues |
+| **Anisotropy** | Mean cosine to centroid direction | Collapse / modality gap severity |
+
+**TwoNN** is chosen over PCA-based ID estimators because it makes no global
+linearity assumption — it only assumes local uniformity on a d-manifold.  For
+CLIP features on varied video content this is more appropriate than assuming a
+globally flat subspace.
+
+**Effective rank** is preferred over raw rank or number of non-negligible
+PCA components because it is differentiable, scale-invariant, and handles the
+gradual eigenvalue decay typical of vision features.
+
+### Automated warnings
+The inspector emits machine-readable warnings for:
+- Any NaN/Inf values in the embedding matrix
+- L2 norms not tightly concentrated around 1.0 (if `l2_normalised=True`)
+- `anisotropy > 0.7` → recommends running `ModalityAligner`
+- `rank_fraction < 0.05` → warns that cosine similarities are unreliable
+
+*Verified by*: `TestEmbeddingInspector` (12 tests) — health report structure,
+no NaN in metrics for clean input, ID > 0, low-rank embeddings produce lower
+effective rank than full-rank, anisotropy near 0 for isotropic / near 1 for
+collapsed, rank fraction bounded, JSON persistence, PNG output, NaN-embedding
+handling.

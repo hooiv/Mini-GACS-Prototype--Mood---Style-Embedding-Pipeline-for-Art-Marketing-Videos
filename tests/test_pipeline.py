@@ -4518,3 +4518,289 @@ class TestSimilarityIndexLengthGuard(unittest.TestCase):
         stats = compute_inter_video_stats(sim, [])
         self.assertTrue(np.isnan(stats["overall_mean"]))
 
+
+
+# ===========================================================================
+# TestCrossModalFusion
+# ===========================================================================
+
+class TestCrossModalFusion(unittest.TestCase):
+    """Tests for uncertainty-weighted Bayesian audio-visual fusion."""
+
+    _AXES = ("energy", "warmth", "complexity", "luxury", "joy", "tension")
+
+    def _make_scores(self, seed: int = 0) -> dict:
+        rng = np.random.default_rng(seed)
+        return {ax: float(rng.uniform(-1, 1)) for ax in self._AXES}
+
+    def _make_variances(self, val: float = 0.1) -> dict:
+        return {ax: val for ax in self._AXES}
+
+    def test_fuse_returns_all_axes(self):
+        from src.cross_modal_fusion import fuse_affective_scores
+        vis = self._make_scores(0)
+        aud = self._make_scores(1)
+        result = fuse_affective_scores(vis, aud)
+        self.assertEqual(set(result.fused_scores.keys()), set(self._AXES))
+
+    def test_equal_variance_gives_midpoint(self):
+        """With equal variances the fused score must equal the arithmetic mean."""
+        from src.cross_modal_fusion import fuse_affective_scores
+        vis = {"energy": 0.8}
+        aud = {"energy": 0.2}
+        var = {"energy": 0.1}
+        result = fuse_affective_scores(vis, aud, var, var, axes=("energy",))
+        expected = (0.8 + 0.2) / 2.0
+        self.assertAlmostEqual(result.fused_scores["energy"], expected, places=5)
+
+    def test_low_visual_variance_pulls_toward_visual(self):
+        """When visual is highly confident it should dominate the fused score."""
+        from src.cross_modal_fusion import fuse_affective_scores
+        vis = {"energy": 1.0}
+        aud = {"energy": -1.0}
+        # Visual very confident, audio very uncertain
+        result = fuse_affective_scores(
+            vis, aud,
+            visual_variances={"energy": 0.001},
+            audio_variances={"energy": 0.9},
+            axes=("energy",),
+        )
+        # Fused score should be much closer to visual (1.0) than audio (-1.0)
+        self.assertGreater(result.fused_scores["energy"], 0.5)
+        self.assertGreater(result.visual_weight["energy"], result.audio_weight["energy"])
+
+    def test_posterior_variance_less_than_both_inputs(self):
+        """Fused variance must be strictly less than either input variance."""
+        from src.cross_modal_fusion import fuse_affective_scores
+        var_v = {"energy": 0.4}
+        var_a = {"energy": 0.3}
+        result = fuse_affective_scores(
+            {"energy": 0.5}, {"energy": 0.5},
+            visual_variances=var_v, audio_variances=var_a,
+            axes=("energy",),
+        )
+        self.assertLess(result.fused_variances["energy"], min(0.4, 0.3))
+
+    def test_weights_sum_to_one(self):
+        from src.cross_modal_fusion import fuse_affective_scores
+        vis = self._make_scores(0)
+        aud = self._make_scores(1)
+        result = fuse_affective_scores(vis, aud)
+        for ax in self._AXES:
+            total = result.visual_weight[ax] + result.audio_weight[ax]
+            self.assertAlmostEqual(total, 1.0, places=5,
+                                   msg=f"Axis '{ax}' weights don't sum to 1.")
+
+    def test_missing_axis_raises_key_error(self):
+        from src.cross_modal_fusion import fuse_affective_scores
+        vis = {"energy": 0.5}  # missing "warmth"
+        aud = {"warmth": 0.3}
+        with self.assertRaises(KeyError):
+            fuse_affective_scores(vis, aud, axes=("energy", "warmth"))
+
+    def test_batch_fusion_shape(self):
+        from src.cross_modal_fusion import fuse_frame_scores_batch
+        n = 12
+        rng = np.random.default_rng(42)
+        vis_per_axis = {ax: rng.uniform(-1, 1, n).astype(np.float32) for ax in self._AXES}
+        audio = self._make_scores(7)
+        result = fuse_frame_scores_batch(vis_per_axis, audio, axes=self._AXES)
+        for ax in self._AXES:
+            self.assertEqual(result[ax].shape, (n,))
+            self.assertEqual(result[ax].dtype, np.float32)
+
+    def test_batch_fusion_with_confidence(self):
+        """Frames with confidence=1 should fuse nearly entirely from visual."""
+        from src.cross_modal_fusion import fuse_frame_scores_batch
+        n = 4
+        # All visual frames identical, audio orthogonal
+        vis = {ax: np.ones(n, dtype=np.float32) for ax in ("energy",)}
+        aud = {"energy": -1.0}
+        conf = {"energy": np.ones(n, dtype=np.float32) * 0.999}  # near-perfect confidence
+        result = fuse_frame_scores_batch(
+            vis, aud, ensemble_confidence=conf, axes=("energy",)
+        )
+        # fused should be close to visual (1.0) not audio (-1.0)
+        self.assertTrue((result["energy"] > 0.5).all())
+
+    def test_batch_fusion_inconsistent_lengths_raises(self):
+        from src.cross_modal_fusion import fuse_frame_scores_batch
+        vis = {"energy": np.ones(5), "warmth": np.ones(4)}  # inconsistent
+        aud = {"energy": 0.0, "warmth": 0.0}
+        with self.assertRaises(ValueError):
+            fuse_frame_scores_batch(vis, aud, axes=("energy", "warmth"))
+
+    def test_save_fusion_results_creates_json(self):
+        from src.cross_modal_fusion import (
+            fuse_affective_scores, save_fusion_results
+        )
+        tmp = tempfile.mkdtemp()
+        vis = self._make_scores(0)
+        aud = self._make_scores(1)
+        result = fuse_affective_scores(vis, aud)
+        index = [{"video_id": "v0", "frame_idx": 0}]
+        out = os.path.join(tmp, "fusion.json")
+        save_fusion_results([result], index, out)
+        self.assertTrue(os.path.exists(out))
+        with open(out) as fp:
+            data = json.load(fp)
+        self.assertEqual(len(data), 1)
+        self.assertIn("fusion", data[0])
+        self.assertIn("fused_scores", data[0]["fusion"])
+
+    def test_save_fusion_results_length_mismatch_raises(self):
+        from src.cross_modal_fusion import (
+            fuse_affective_scores, save_fusion_results
+        )
+        tmp = tempfile.mkdtemp()
+        result = fuse_affective_scores(self._make_scores(0), self._make_scores(1))
+        with self.assertRaises(ValueError):
+            save_fusion_results([result], [], os.path.join(tmp, "x.json"))
+
+    def test_plot_fusion_weights_creates_png(self):
+        from src.cross_modal_fusion import fuse_affective_scores, plot_fusion_weights
+        tmp = tempfile.mkdtemp()
+        result = fuse_affective_scores(self._make_scores(0), self._make_scores(1))
+        out = os.path.join(tmp, "weights.png")
+        plot_fusion_weights(result, out)
+        self.assertTrue(os.path.exists(out))
+
+    def test_ensemble_confidence_to_variances(self):
+        from src.cross_modal_fusion import ensemble_confidence_to_variances
+        conf = {"energy": np.array([0.0, 0.5, 1.0], dtype=np.float32)}
+        variances = ensemble_confidence_to_variances(conf)
+        # confidence=1.0 → variance=_MIN_VARIANCE (floored)
+        self.assertAlmostEqual(float(variances["energy"][2]), 1e-4, places=5)
+        # confidence=0.0 → variance=1.0
+        self.assertAlmostEqual(float(variances["energy"][0]), 1.0, places=5)
+
+    def test_audio_features_to_variances_high_score_gives_high_variance(self):
+        from src.cross_modal_fusion import audio_features_to_variances
+        scores = {"energy": 0.95, "warmth": 0.1}
+        variances = audio_features_to_variances(scores, clipping_threshold=0.95)
+        self.assertGreater(variances["energy"], variances["warmth"])
+
+
+# ===========================================================================
+# TestEmbeddingInspector
+# ===========================================================================
+
+class TestEmbeddingInspector(unittest.TestCase):
+    """Tests for intrinsic dimensionality estimation and embedding health."""
+
+    def _unit_embs(self, n: int, dim: int = 32, seed: int = 0) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        raw = rng.standard_normal((n, dim)).astype(np.float32)
+        return raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
+    def _low_rank_embs(self, n: int, dim: int = 32, rank: int = 3,
+                       seed: int = 0) -> np.ndarray:
+        """Embeddings drawn from a rank-*rank* subspace."""
+        rng = np.random.default_rng(seed)
+        basis = rng.standard_normal((dim, rank)).astype(np.float32)
+        coords = rng.standard_normal((n, rank)).astype(np.float32)
+        embs = coords @ basis.T
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        return embs
+
+    def test_health_report_basic_shape(self):
+        from src.embedding_inspector import compute_health_report
+        embs = self._unit_embs(20, dim=16)
+        report = compute_health_report(embs)
+        self.assertEqual(report.n_samples, 20)
+        self.assertEqual(report.ambient_dim, 16)
+        self.assertEqual(report.n_nan, 0)
+        self.assertEqual(report.n_inf, 0)
+
+    def test_health_report_no_nan_in_metrics(self):
+        from src.embedding_inspector import compute_health_report
+        embs = self._unit_embs(30, dim=16)
+        report = compute_health_report(embs)
+        self.assertFalse(np.isnan(report.intrinsic_dim_twonn),
+                         "TwoNN ID should not be NaN for clean embeddings.")
+        self.assertFalse(np.isnan(report.effective_rank),
+                         "Effective rank should not be NaN.")
+
+    def test_intrinsic_dim_positive(self):
+        from src.embedding_inspector import compute_health_report
+        embs = self._unit_embs(50, dim=32)
+        report = compute_health_report(embs)
+        self.assertGreater(report.intrinsic_dim_twonn, 0.0)
+
+    def test_low_rank_embeddings_have_lower_effective_rank(self):
+        from src.embedding_inspector import compute_health_report
+        full_rank = self._unit_embs(50, dim=32)
+        low_rank = self._low_rank_embs(50, dim=32, rank=3)
+        report_full = compute_health_report(full_rank)
+        report_low = compute_health_report(low_rank)
+        # Low-rank embeddings should have strictly smaller effective rank
+        self.assertLess(report_low.effective_rank, report_full.effective_rank)
+
+    def test_effective_rank_bounded_by_ambient_dim(self):
+        from src.embedding_inspector import compute_health_report
+        embs = self._unit_embs(30, dim=16)
+        report = compute_health_report(embs)
+        # Effective rank cannot exceed min(N, D)
+        self.assertLessEqual(report.effective_rank, report.ambient_dim + 0.1)
+
+    def test_anisotropy_low_for_isotropic(self):
+        """Random unit vectors on a sphere should have low anisotropy."""
+        from src.embedding_inspector import compute_anisotropy
+        rng = np.random.default_rng(0)
+        embs = rng.standard_normal((200, 64)).astype(np.float32)
+        embs /= np.linalg.norm(embs, axis=1, keepdims=True)
+        aniso = compute_anisotropy(embs)
+        # Expect near 0 for uniform distribution on high-dim sphere
+        self.assertLess(aniso, 0.3)
+
+    def test_anisotropy_high_for_collapsed(self):
+        """Embeddings collapsed to a single direction should have anisotropy ≈ 1."""
+        from src.embedding_inspector import compute_anisotropy
+        n = 50
+        base = np.zeros((n, 16), dtype=np.float32)
+        base[:, 0] = 1.0  # all embeddings point along axis 0
+        aniso = compute_anisotropy(base)
+        self.assertGreater(aniso, 0.95)
+
+    def test_twonn_too_few_samples_raises(self):
+        from src.embedding_inspector import estimate_intrinsic_dim_twonn
+        embs = self._unit_embs(5, dim=8)
+        with self.assertRaises(ValueError):
+            estimate_intrinsic_dim_twonn(embs)
+
+    def test_rank_fraction_in_zero_one(self):
+        from src.embedding_inspector import compute_health_report
+        embs = self._unit_embs(30, dim=16)
+        report = compute_health_report(embs)
+        self.assertGreater(report.rank_fraction, 0.0)
+        self.assertLessEqual(report.rank_fraction, 1.01)
+
+    def test_save_health_report_creates_json(self):
+        from src.embedding_inspector import compute_health_report, save_health_report
+        tmp = tempfile.mkdtemp()
+        embs = self._unit_embs(20, dim=16)
+        report = compute_health_report(embs)
+        out = os.path.join(tmp, "health.json")
+        save_health_report(report, out)
+        self.assertTrue(os.path.exists(out))
+        with open(out) as fp:
+            data = json.load(fp)
+        self.assertIn("intrinsic_dim_twonn", data)
+        self.assertIn("effective_rank", data)
+
+    def test_plot_singular_value_spectrum_creates_png(self):
+        from src.embedding_inspector import plot_singular_value_spectrum
+        tmp = tempfile.mkdtemp()
+        embs = self._unit_embs(30, dim=16)
+        out = os.path.join(tmp, "spectrum.png")
+        plot_singular_value_spectrum(embs, out, top_k=10)
+        self.assertTrue(os.path.exists(out))
+
+    def test_health_report_with_nan_embeddings(self):
+        """Health report should count NaNs and return gracefully."""
+        from src.embedding_inspector import compute_health_report
+        embs = self._unit_embs(20, dim=16)
+        embs[0, 0] = float("nan")
+        report = compute_health_report(embs)
+        self.assertGreater(report.n_nan, 0)
+        # Report should not raise even with a NaN embedding

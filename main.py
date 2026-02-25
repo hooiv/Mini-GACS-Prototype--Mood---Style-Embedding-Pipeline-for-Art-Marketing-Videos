@@ -1375,6 +1375,104 @@ def main() -> None:
         logger.warning("Vector store step failed (%s); continuing.", exc)
 
     # -----------------------------------------------------------------------
+    # Step 20 – Embedding health inspection (intrinsic dim, rank, anisotropy)
+    # -----------------------------------------------------------------------
+    print("\n── Step 20: Embedding health inspection ────────────────────────────")
+    try:
+        from src.embedding_inspector import (
+            compute_health_report,
+            save_health_report,
+            plot_singular_value_spectrum,
+            plot_health_dashboard,
+        )
+
+        if embeddings is not None and len(embeddings) > 0:
+            report = compute_health_report(embeddings)
+            print(report.summary())
+
+            health_json = os.path.join(OUTPUTS_DIR, "embedding_health.json")
+            save_health_report(report, health_json)
+            print(f"  Health report saved: {health_json}")
+
+            spectrum_png = os.path.join(OUTPUTS_DIR, "embedding_spectrum.png")
+            plot_singular_value_spectrum(embeddings, spectrum_png, top_k=min(50, embeddings.shape[1] - 1))
+            print(f"  Spectrum plot saved: {spectrum_png}")
+
+            dashboard_png = os.path.join(OUTPUTS_DIR, "embedding_dashboard.png")
+            plot_health_dashboard(report, dashboard_png)
+            print(f"  Dashboard saved: {dashboard_png}")
+
+            manifest.record(
+                "embedding_health",
+                intrinsic_dim=report.intrinsic_dim_twonn,
+                effective_rank=report.effective_rank,
+                rank_fraction=report.rank_fraction,
+                anisotropy=report.anisotropy,
+                n_warnings=len(report.warnings),
+            )
+            manifest.add_artifact(health_json, "Embedding health report")
+        else:
+            print("  No embeddings available; skipping health inspection.")
+
+    except (ImportError, OSError, ValueError) as exc:
+        logger.warning("Embedding health step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 21 – Cross-modal audio-visual affective fusion
+    # -----------------------------------------------------------------------
+    print("\n── Step 21: Cross-modal audio-visual fusion ────────────────────────")
+    try:
+        from src.cross_modal_fusion import (
+            fuse_affective_scores,
+            plot_fusion_weights,
+            plot_fused_vs_unimodal,
+            audio_features_to_variances,
+        )
+        from src.audio_features import (
+            generate_synthetic_audio_features,
+            map_to_affective_axes,
+        )
+
+        if video_level_scores:
+            # Use synthetic audio when ffmpeg/audio extraction unavailable (demo)
+            synth_feats = generate_synthetic_audio_features(
+                len(video_level_scores), seed=42
+            )
+            print(f"  Fusing audio + visual scores for {len(video_level_scores)} video(s)…")
+
+            for i, (vid_id, vis_scores) in enumerate(video_level_scores.items()):
+                aud_scores = map_to_affective_axes(synth_feats[i])
+                aud_var = audio_features_to_variances(aud_scores)
+
+                result = fuse_affective_scores(vis_scores, aud_scores,
+                                               audio_variances=aud_var)
+                print(
+                    f"  {vid_id}: fused energy={result.fused_scores['energy']:+.3f} "
+                    f"(vis_w={result.visual_weight['energy']:.2f}, "
+                    f"aud_w={result.audio_weight['energy']:.2f})"
+                )
+
+                weights_png = os.path.join(OUTPUTS_DIR, f"fusion_weights_{vid_id}.png")
+                plot_fusion_weights(result, weights_png, title=f"Fusion weights — {vid_id}")
+                print(f"    Fusion weights chart: {weights_png}")
+
+                radar_png = os.path.join(OUTPUTS_DIR, f"fusion_radar_{vid_id}.png")
+                plot_fused_vs_unimodal(vis_scores, aud_scores, result, radar_png,
+                                       title=f"Unimodal vs Fused — {vid_id}")
+                print(f"    Fusion radar chart:   {radar_png}")
+
+                manifest.record(
+                    f"cross_modal_fusion_{vid_id}",
+                    fused_energy=result.fused_scores["energy"],
+                    vis_weight_mean=float(np.mean(list(result.visual_weight.values()))),
+                )
+        else:
+            print("  No video-level affective scores available; skipping fusion demo.")
+
+    except (ImportError, KeyError, ValueError, OSError) as exc:
+        logger.warning("Cross-modal fusion step failed (%s); continuing.", exc)
+
+    # -----------------------------------------------------------------------
     # Step 14 – Save run manifest
     # -----------------------------------------------------------------------
     manifest_path = os.path.join(OUTPUTS_DIR, "run_manifest.json")
